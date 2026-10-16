@@ -2,26 +2,24 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/MrEx-Right/SubReaper/internal/models"
 	"github.com/MrEx-Right/SubReaper/internal/resolver"
 )
 
-// stageTXT performs analysis of TXT, SPF, and DMARC records for the root domain.
+// stageTXT performs analysis of TXT, SPF, and DMARC records for a registrable
+// domain. The pipeline runs it once per registrable domain, never per subdomain,
+// because subdomains normally inherit the parent's email policy through DMARC
+// and rarely publish SPF of their own.
 //
-// Unlike other stages, this stage always runs (not gated by dangling DNS) because
-// missing or misconfigured email protection records are a direct takeover enabler:
-//   - A dangling MX record + no SPF/DMARC = trivial email spoofing
-//   - Orphaned verification tokens (Google/Amazon/Facebook) may be re-claimable
-//
-// The stage returns an additional Finding only when a TXT-level issue is discovered
-// independently of CNAME/NS/MX dangles. It also annotates an existing finding with
-// TXTRecords so they appear in reports.
+// It returns nothing when the domain does not exist or the lookup fails, so a
+// resolver error can never be mistaken for a missing record.
 func stageTXT(ctx context.Context, domain string, res *resolver.Resolver) ([]models.TXTRecord, []emailIssue) {
 	rawRecords, err := res.ResolveTXT(ctx, domain)
 	if err != nil {
-		return nil, nil
+		return nil, nil // includes resolver.ErrNXDOMAIN
 	}
 
 	var analysed []models.TXTRecord
@@ -29,6 +27,7 @@ func stageTXT(ctx context.Context, domain string, res *resolver.Resolver) ([]mod
 
 	hasSPF := false
 	hasDMARC := false
+	var services []string
 
 	for _, raw := range rawRecords {
 		rec := analyseTXTRecord(raw, domain)
@@ -40,7 +39,7 @@ func stageTXT(ctx context.Context, domain string, res *resolver.Resolver) ([]mod
 			if rec.Issue != "" {
 				issues = append(issues, emailIssue{
 					findingType: models.FindingSPFWeak,
-					severity:    models.SeverityMedium,
+					severity:    spfSeverity(rec.Raw),
 					description: rec.Issue,
 					remediation: "Tighten SPF policy: replace ~all or +all with -all (hard fail).",
 				})
@@ -50,25 +49,31 @@ func stageTXT(ctx context.Context, domain string, res *resolver.Resolver) ([]mod
 			if rec.Issue != "" {
 				issues = append(issues, emailIssue{
 					findingType: models.FindingDMARCWeak,
-					severity:    models.SeverityMedium,
+					severity:    models.SeverityLow,
 					description: rec.Issue,
 					remediation: "Set DMARC policy to p=quarantine or p=reject to prevent email spoofing.",
 				})
 			}
 		case "verification":
-			if rec.Issue != "" {
-				// Orphaned ownership token — could be re-claimed
-				issues = append(issues, emailIssue{
-					findingType: models.FindingTXTDangling,
-					severity:    models.SeverityHigh,
-					description: rec.Issue,
-					remediation: "Remove the orphaned domain verification TXT record. It may allow an attacker to claim ownership of this domain in a third-party service.",
-				})
+			if rec.Domain != "" {
+				services = append(services, rec.Domain)
 			}
 		}
 	}
 
-	// Missing SPF — contributes to email takeover risk (especially if MX is also dangling)
+	// Verification tokens are normal; they only matter if a service is no
+	// longer used, which DNS alone cannot tell. Report them once, for review.
+	if len(services) > 0 {
+		issues = append(issues, emailIssue{
+			findingType: models.FindingTXTDangling,
+			severity:    models.SeverityInfo,
+			description: fmt.Sprintf("%d domain verification token(s) present (%s). Review whether each service is still in use.",
+				len(services), strings.Join(uniqueStrings(services), ", ")),
+			remediation: "Remove verification TXT records for services that are no longer in use.",
+		})
+	}
+
+	// Missing SPF — anyone can send mail claiming to be this domain
 	if !hasSPF {
 		issues = append(issues, emailIssue{
 			findingType: models.FindingSPFMissing,
@@ -89,6 +94,32 @@ func stageTXT(ctx context.Context, domain string, res *resolver.Resolver) ([]mod
 	}
 
 	return analysed, issues
+}
+
+func uniqueStrings(in []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// spfSeverity grades a weak SPF policy: +all allows anyone, ?all is neutral,
+// ~all (softfail) is common and safe together with an enforcing DMARC policy.
+func spfSeverity(spf string) models.Severity {
+	lower := strings.ToLower(spf)
+	switch {
+	case strings.Contains(lower, "+all"):
+		return models.SeverityHigh
+	case strings.Contains(lower, "?all"):
+		return models.SeverityLow
+	default:
+		return models.SeverityInfo
+	}
 }
 
 // emailIssue represents a TXT/email-level security problem.
@@ -132,37 +163,37 @@ func analyseTXTRecord(raw, domain string) models.TXTRecord {
 	case strings.HasPrefix(lower, "facebook-domain-verification="):
 		rec.Kind = "verification"
 		rec.Domain = "Facebook"
-		rec.Issue = "Potential orphaned Facebook domain verification token. Verify this token is still actively used."
+		rec.Issue = "Facebook domain verification token present. Review whether the service is still in use."
 
 	case strings.HasPrefix(lower, "amazonses:"):
 		rec.Kind = "verification"
 		rec.Domain = "Amazon SES"
-		rec.Issue = "Potential orphaned Amazon SES verification token. If SES is no longer configured, remove this record."
+		rec.Issue = "Amazon SES verification token present. If SES is no longer configured, remove this record."
 
 	case strings.HasPrefix(lower, "ms="):
 		rec.Kind = "verification"
 		rec.Domain = "Microsoft 365"
-		rec.Issue = "Potential orphaned Microsoft 365 domain verification token. Verify this token is still actively used."
+		rec.Issue = "Microsoft 365 domain verification token present. Review whether the service is still in use."
 
 	case strings.HasPrefix(lower, "atlassian-domain-verification="):
 		rec.Kind = "verification"
 		rec.Domain = "Atlassian"
-		rec.Issue = "Potential orphaned Atlassian domain verification token."
+		rec.Issue = "Atlassian domain verification token present. Review whether the service is still in use."
 
 	case strings.HasPrefix(lower, "cisco-ci-domain-verification="):
 		rec.Kind = "verification"
 		rec.Domain = "Cisco"
-		rec.Issue = "Potential orphaned Cisco domain verification token."
+		rec.Issue = "Cisco domain verification token present. Review whether the service is still in use."
 
 	case strings.HasPrefix(lower, "docusign="):
 		rec.Kind = "verification"
 		rec.Domain = "DocuSign"
-		rec.Issue = "Potential orphaned DocuSign domain verification token."
+		rec.Issue = "DocuSign domain verification token present. Review whether the service is still in use."
 
 	case strings.HasPrefix(lower, "stripe-verification="):
 		rec.Kind = "verification"
 		rec.Domain = "Stripe"
-		rec.Issue = "Potential orphaned Stripe domain verification token."
+		rec.Issue = "Stripe domain verification token present. Review whether the service is still in use."
 
 	case strings.HasPrefix(lower, "have-i-been-pwned-verification="):
 		rec.Kind = "verification"
@@ -199,9 +230,8 @@ func analyseDMARC(dmarc string) string {
 	return ""
 }
 
-// checkOrphanedToken is a placeholder for future active verification.
-// Currently flags all verification tokens as potentially orphaned since
-// we cannot verify ownership without the service's API.
+// checkOrphanedToken describes a verification token for review. DNS alone
+// cannot tell whether the service is still in use.
 func checkOrphanedToken(service, _ string) string {
-	return "Potential orphaned " + service + " domain verification token. If this service is no longer in use, remove the record — it could allow an attacker to claim ownership."
+	return service + " domain verification token present. Review whether the service is still in use."
 }

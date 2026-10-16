@@ -2,12 +2,9 @@ package cmd
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/MrEx-Right/SubReaper/internal/engine"
 	"github.com/MrEx-Right/SubReaper/internal/report"
@@ -41,19 +38,6 @@ func init() {
 }
 
 func runScan(cmd *cobra.Command, args []string) error {
-	// Resolve JSON shorthand
-	if cfg.JSON {
-		cfg.Format = "json"
-	}
-
-	showUI := !cfg.Silent && cfg.Format == "terminal"
-
-	// Print banner unless silent or JSON
-	if showUI {
-		report.PrintBanner(os.Stdout, cfg.NoColor)
-	}
-
-	// Load target list
 	domains, err := buildDomainList(cfg.Target, cfg.List)
 	if err != nil {
 		return err
@@ -62,61 +46,33 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no targets specified — use --target or --list")
 	}
 
-	// Load custom resolvers if specified
-	if cfg.ResolversFile != "" {
-		resolvers, err := loadLines(cfg.ResolversFile)
-		if err != nil {
-			return fmt.Errorf("load resolvers: %w", err)
-		}
-		cfg.Resolvers = resolvers
+	r, err := prepareRun()
+	if err != nil {
+		return err
 	}
 
-	// Setup context with clean cancellation
-	ctx, cancel := context.WithCancel(context.Background())
+	if r.showUI {
+		report.PrintBanner(os.Stderr, cfg.NoColor)
+	}
+
+	ctx, cancel := signalContext()
 	defer cancel()
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		<-sigCh
-		if !cfg.Silent {
-			fmt.Fprintln(os.Stderr, "\n[!] Interrupted — cleaning up...")
-		}
-		cancel()
-	}()
 
-	// ── Animated progress bar ──────────────────────────────────────────────
-	bar := ui.NewScanBar(os.Stdout, len(domains), showUI)
-
+	bar := ui.NewScanBar(os.Stderr, len(domains), r.showUI)
 	progressFn := func(scanned, total, findings int) {
-		// current domain isn't available at this callback level; pass empty
 		bar.Tick("", scanned, findings)
 	}
 
-	// Run the engine
-	e := engine.New(cfg)
-	result := e.Scan(ctx, domains, progressFn)
+	result := engine.New(cfg).Scan(ctx, domains, progressFn)
 	result.Target = cfg.Target
-
 	bar.Finish()
 
-	if showUI {
-		ui.PrintScanComplete(os.Stdout, cfg.NoColor, result.Stats.FindingsTotal,
+	if r.showUI {
+		ui.PrintScanComplete(os.Stderr, cfg.NoColor, result.Stats.FindingsTotal,
 			result.Duration.Round(1_000_000).String())
 	}
 
-	// Write output
-	w, cleanup, err := outputWriter()
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	reporter, err := newReporter()
-	if err != nil {
-		return err
-	}
-
-	return reporter.Write(w, result)
+	return r.finish(result)
 }
 
 // buildDomainList combines a single target and a list file into one slice.
@@ -125,7 +81,7 @@ func buildDomainList(target, listFile string) ([]string, error) {
 	var domains []string
 
 	add := func(d string) {
-		d = strings.TrimSpace(strings.ToLower(d))
+		d = strings.TrimSuffix(strings.TrimSpace(strings.ToLower(d)), ".")
 		if d == "" || strings.HasPrefix(d, "#") {
 			return
 		}

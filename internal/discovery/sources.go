@@ -1,107 +1,98 @@
 // Package discovery — sources.go
-// Provides passive subdomain enumeration from multiple free OSINT sources.
-// All sources are queryable without API keys.
+// Provides passive subdomain enumeration from multiple OSINT sources.
 //
 // Sources included:
-//   - Hackertarget    (hackertarget.com/subdomains)
+//   - crt.sh          (Certificate Transparency)
+//   - Hackertarget    (api.hackertarget.com/hostsearch)
 //   - URLScan.io      (urlscan.io/api/v1/search)
 //   - Wayback Machine (web.archive.org CDX API)
 //   - RapidDNS        (rapiddns.io/subdomain)
-//   - Anubis/JLDC     (jldc.me/anubis/subdomains)
-//   - AlienVault OTX  (otx.alienvault.com — no key needed for passive)
+//   - Anubis          (anubisdb.com, formerly jldc.me)
 //   - CertSpotter     (api.certspotter.com/v1/issuances)
+//   - AlienVault OTX  (otx.alienvault.com — requires OTX_API_KEY)
 package discovery
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-// SourceOptions configures which passive OSINT sources to query.
-type SourceOptions struct {
-	// Sources is an explicit whitelist of source names.
-	// If empty and AllSources is false, defaults to the built-in free set.
-	Sources    []string
-	AllSources bool // Query every available source
-}
+const userAgent = "SubReaper/2.0 (+https://github.com/MrEx-Right/SubReaper)"
 
-// AllFreeSources lists every built-in passive source name.
+// ErrAPIKeyRequired is returned by sources that need an API key which is not set.
+var ErrAPIKeyRequired = errors.New("API key required")
+
+// AllFreeSources lists every built-in passive source that works without an
+// API key, except crt.sh, which the commands control with --no-crtsh.
 var AllFreeSources = []string{
 	"hackertarget",
 	"urlscan",
 	"wayback",
 	"rapiddns",
 	"anubis",
-	"alienvault",
 	"certspotter",
 }
 
-// QueryAll queries all selected passive OSINT sources concurrently and returns
-// a deduplicated list of discovered subdomains. Partial failures are silently
-// tolerated so that one broken source doesn't abort the entire run.
-func QueryAll(ctx context.Context, domain string, opts SourceOptions) ([]string, error) {
-	names := opts.Sources
-	if opts.AllSources || len(names) == 0 {
-		names = AllFreeSources
-	}
+// KeyedSources lists sources that need an API key from the environment.
+// They are included in --all-sources only when their key is set.
+var KeyedSources = map[string]string{
+	"alienvault": "OTX_API_KEY",
+}
 
-	type result struct {
-		subs []string
-		src  string
-		err  error
+// DefaultSources returns the free sources plus every keyed source whose key
+// is present in the environment.
+func DefaultSources() []string {
+	out := append([]string(nil), AllFreeSources...)
+	for name, env := range KeyedSources {
+		if os.Getenv(env) != "" {
+			out = append(out, name)
+		}
 	}
+	return out
+}
 
-	resultCh := make(chan result, len(names))
+// SourceResult is the outcome of one source query.
+type SourceResult struct {
+	Source     string
+	Subdomains []string
+	Err        error
+	Duration   time.Duration
+}
+
+// QuerySources queries the named sources concurrently and returns one result
+// per source, in the order given. A failing source never affects the others.
+func QuerySources(ctx context.Context, domain string, names []string) []SourceResult {
+	results := make([]SourceResult, len(names))
 	var wg sync.WaitGroup
-
-	for _, name := range names {
+	for i, name := range names {
 		wg.Add(1)
-		go func(src string) {
+		go func(i int, src string) {
 			defer wg.Done()
+			start := time.Now()
 			subs, err := QuerySource(ctx, src, domain)
-			resultCh <- result{subs: subs, src: src, err: err}
-		}(name)
+			results[i] = SourceResult{Source: src, Subdomains: subs, Err: err, Duration: time.Since(start)}
+		}(i, name)
 	}
-
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	seen := make(map[string]struct{})
-	var all []string
-
-	for r := range resultCh {
-		if r.err != nil {
-			// Non-fatal — continue with other sources
-			continue
-		}
-		for _, s := range r.subs {
-			s = strings.ToLower(strings.TrimSpace(s))
-			if s == "" {
-				continue
-			}
-			if _, ok := seen[s]; !ok {
-				seen[s] = struct{}{}
-				all = append(all, s)
-			}
-		}
-	}
-
-	return all, nil
+	wg.Wait()
+	return results
 }
 
 // QuerySource dispatches a query to the named source.
 func QuerySource(ctx context.Context, source, domain string) ([]string, error) {
 	switch source {
+	case "crtsh", "crt.sh":
+		return QueryCrtSh(ctx, domain)
 	case "hackertarget":
 		return QueryHackertarget(ctx, domain)
 	case "urlscan":
@@ -112,7 +103,7 @@ func QuerySource(ctx context.Context, source, domain string) ([]string, error) {
 		return QueryRapidDNS(ctx, domain)
 	case "anubis":
 		return QueryAnubis(ctx, domain)
-	case "alienvault":
+	case "alienvault", "otx":
 		return QueryAlienVault(ctx, domain)
 	case "certspotter":
 		return QueryCertSpotter(ctx, domain)
@@ -123,14 +114,25 @@ func QuerySource(ctx context.Context, source, domain string) ([]string, error) {
 
 // ─── HTTP helper ─────────────────────────────────────────────────────────────
 
-func httpGet(ctx context.Context, rawURL string, timeout time.Duration) ([]byte, error) {
-	client := &http.Client{Timeout: timeout}
+func newRequest(ctx context.Context, rawURL string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "SubReaper/1.0 (passive-osint)")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json, text/plain, text/html;q=0.9, */*;q=0.8")
+	return req, nil
+}
+
+func httpGet(ctx context.Context, rawURL string, timeout time.Duration, headers map[string]string) ([]byte, error) {
+	client := &http.Client{Timeout: timeout}
+	req, err := newRequest(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -139,54 +141,78 @@ func httpGet(ctx context.Context, rawURL string, timeout time.Duration) ([]byte,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, rawURL)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	return io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 }
 
-// ─── normalise helper ─────────────────────────────────────────────────────────
+// ─── normalise helpers ───────────────────────────────────────────────────────
 
-// filterSubdomains removes entries that are not subdomains of the target domain.
+// filterSubdomains removes entries that are not subdomains of the target
+// domain and removes duplicates.
 func filterSubdomains(domain string, items []string) []string {
+	domain = strings.ToLower(domain)
 	suffix := "." + domain
+	seen := make(map[string]struct{})
 	var out []string
 	for _, s := range items {
 		s = strings.ToLower(strings.TrimSpace(s))
 		s = strings.TrimPrefix(s, "*.")
 		s = strings.TrimSuffix(s, ".")
-		if s == domain || strings.HasSuffix(s, suffix) {
+		if s != domain && !strings.HasSuffix(s, suffix) {
+			continue
+		}
+		if !validHostname(s) {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
 			out = append(out, s)
 		}
 	}
 	return out
 }
 
+var hostnameRe = regexp.MustCompile(`^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)+$`)
+
+func validHostname(s string) bool {
+	return len(s) <= 253 && hostnameRe.MatchString(s)
+}
+
+// hostsIn extracts every hostname under domain that appears anywhere in text.
+func hostsIn(domain, text string) []string {
+	re := regexp.MustCompile(`(?i)(?:[a-z0-9_*](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+` + regexp.QuoteMeta(domain) + `\b`)
+	return filterSubdomains(domain, re.FindAllString(text, -1))
+}
+
 // ─── Source: Hackertarget ────────────────────────────────────────────────────
 
-// QueryHackertarget queries hackertarget.com's free subdomain finder API.
-// No API key required; returns plain-text newline-separated results.
+// QueryHackertarget queries hackertarget.com's free host search API.
+// No API key required; returns plain-text "host,ip" lines.
 func QueryHackertarget(ctx context.Context, domain string) ([]string, error) {
 	apiURL := fmt.Sprintf("https://api.hackertarget.com/hostsearch/?q=%s", url.QueryEscape(domain))
-	body, err := httpGet(ctx, apiURL, 30*time.Second)
+	body, err := httpGet(ctx, apiURL, 30*time.Second, nil)
 	if err != nil {
 		return nil, fmt.Errorf("hackertarget: %w", err)
 	}
-
-	// Response is: subdomain,ip — one per line
-	var subs []string
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "error") {
-			continue
-		}
-		parts := strings.SplitN(line, ",", 2)
-		subs = append(subs, strings.TrimSpace(parts[0]))
+	text := strings.TrimSpace(string(body))
+	if strings.HasPrefix(strings.ToLower(text), "error") || strings.Contains(text, "API count exceeded") {
+		return nil, fmt.Errorf("hackertarget: %s", firstLine(text))
 	}
-	return filterSubdomains(domain, subs), nil
+	return parseHackertarget(domain, text), nil
 }
 
-// ─── Source: URLScan.io ───────────────────────────────────────────────────────
+func parseHackertarget(domain, text string) []string {
+	var subs []string
+	for _, line := range strings.Split(text, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ",", 2)
+		subs = append(subs, parts[0])
+	}
+	return filterSubdomains(domain, subs)
+}
+
+// ─── Source: URLScan.io ──────────────────────────────────────────────────────
 
 type urlScanResponse struct {
 	Results []struct {
@@ -200,13 +226,17 @@ type urlScanResponse struct {
 }
 
 // QueryURLScan queries the urlscan.io public search API.
-// Rate-limited but free without a key for passive queries.
+// Works without a key; URLSCAN_API_KEY raises the rate limit if set.
 func QueryURLScan(ctx context.Context, domain string) ([]string, error) {
 	apiURL := fmt.Sprintf(
-		"https://urlscan.io/api/v1/search/?q=domain:%s&size=10000",
+		"https://urlscan.io/api/v1/search/?q=domain:%s&size=1000",
 		url.QueryEscape(domain),
 	)
-	body, err := httpGet(ctx, apiURL, 30*time.Second)
+	var headers map[string]string
+	if key := os.Getenv("URLSCAN_API_KEY"); key != "" {
+		headers = map[string]string{"API-Key": key}
+	}
+	body, err := httpGet(ctx, apiURL, 30*time.Second, headers)
 	if err != nil {
 		return nil, fmt.Errorf("urlscan: %w", err)
 	}
@@ -216,90 +246,87 @@ func QueryURLScan(ctx context.Context, domain string) ([]string, error) {
 		return nil, fmt.Errorf("urlscan decode: %w", err)
 	}
 
-	seen := make(map[string]struct{})
 	var subs []string
 	for _, r := range resp.Results {
-		for _, d := range []string{r.Task.Domain, r.Page.Domain} {
-			d = strings.ToLower(strings.TrimSpace(d))
-			if d == "" {
-				continue
-			}
-			if _, ok := seen[d]; !ok {
-				seen[d] = struct{}{}
-				subs = append(subs, d)
-			}
-		}
+		subs = append(subs, r.Task.Domain, r.Page.Domain)
 	}
 	return filterSubdomains(domain, subs), nil
 }
 
 // ─── Source: Wayback Machine ─────────────────────────────────────────────────
 
-// QueryWaybackMachine queries the Internet Archive CDX API for all known URLs
-// of the domain, then extracts unique hostnames.
+// waybackBudget bounds how long the CDX stream is read. The CDX API streams
+// slowly for large domains, so results are collected as they arrive and the
+// partial set is returned when the budget runs out.
+var waybackBudget = 45 * time.Second
+
+// QueryWaybackMachine queries the Internet Archive CDX API for known URLs of
+// the domain and extracts unique hostnames.
 func QueryWaybackMachine(ctx context.Context, domain string) ([]string, error) {
 	apiURL := fmt.Sprintf(
-		"https://web.archive.org/cdx/search/cdx?url=*.%s/*&output=text&fl=original&collapse=urlkey&limit=100000",
+		"https://web.archive.org/cdx/search/cdx?url=*.%s&fl=original&collapse=urlkey&output=text&limit=50000",
 		url.QueryEscape(domain),
 	)
-	body, err := httpGet(ctx, apiURL, 60*time.Second)
+
+	ctx, cancel := context.WithTimeout(ctx, waybackBudget)
+	defer cancel()
+	req, err := newRequest(ctx, apiURL)
 	if err != nil {
 		return nil, fmt.Errorf("wayback: %w", err)
 	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("wayback: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("wayback: HTTP %d", resp.StatusCode)
+	}
 
-	// Extract hostnames from URLs
-	re := regexp.MustCompile(`https?://([a-zA-Z0-9._-]+)`)
-	matches := re.FindAllStringSubmatch(string(body), -1)
+	subs, readErr := parseWayback(domain, io.LimitReader(resp.Body, 64*1024*1024))
+	if readErr != nil && len(subs) == 0 {
+		return nil, fmt.Errorf("wayback: %w", readErr)
+	}
+	return subs, nil // partial results on timeout are still useful
+}
 
-	seen := make(map[string]struct{})
-	var subs []string
-	for _, m := range matches {
-		if len(m) < 2 {
-			continue
-		}
-		host := strings.ToLower(m[1])
-		if _, ok := seen[host]; !ok {
-			seen[host] = struct{}{}
-			subs = append(subs, host)
+var waybackHostRe = regexp.MustCompile(`^(?i)(?:[a-z][a-z0-9+.-]*://)?([^/:?#\s]+)`)
+
+func parseWayback(domain string, r io.Reader) ([]string, error) {
+	var hosts []string
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		if m := waybackHostRe.FindStringSubmatch(strings.TrimSpace(sc.Text())); m != nil {
+			hosts = append(hosts, m[1])
 		}
 	}
-	return filterSubdomains(domain, subs), nil
+	return filterSubdomains(domain, hosts), sc.Err()
 }
 
 // ─── Source: RapidDNS ────────────────────────────────────────────────────────
 
-// QueryRapidDNS queries rapiddns.io for subdomains.
-// Free, no API key required.
+// QueryRapidDNS scrapes rapiddns.io's subdomain page (HTML table).
 func QueryRapidDNS(ctx context.Context, domain string) ([]string, error) {
-	apiURL := fmt.Sprintf("https://rapiddns.io/subdomain/%s?full=1&down=1", url.QueryEscape(domain))
-	body, err := httpGet(ctx, apiURL, 30*time.Second)
+	apiURL := fmt.Sprintf("https://rapiddns.io/subdomain/%s?full=1", url.PathEscape(domain))
+	body, err := httpGet(ctx, apiURL, 45*time.Second, nil)
 	if err != nil {
 		return nil, fmt.Errorf("rapiddns: %w", err)
 	}
-
-	// Response is plain-text, one subdomain per line
-	var subs []string
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "#") {
-			subs = append(subs, line)
-		}
-	}
-	return filterSubdomains(domain, subs), nil
+	return hostsIn(domain, string(body)), nil
 }
 
-// ─── Source: Anubis / JLDC ───────────────────────────────────────────────────
+// ─── Source: Anubis ──────────────────────────────────────────────────────────
 
-// QueryAnubis queries the Anubis passive DNS API at jldc.me.
-// Free, no API key required.
+// QueryAnubis queries the Anubis subdomain database (anubisdb.com).
+// The old jldc.me endpoint now only redirects there.
 func QueryAnubis(ctx context.Context, domain string) ([]string, error) {
-	apiURL := fmt.Sprintf("https://jldc.me/anubis/subdomains/%s", url.QueryEscape(domain))
-	body, err := httpGet(ctx, apiURL, 20*time.Second)
+	apiURL := fmt.Sprintf("https://anubisdb.com/anubis/subdomains/%s", url.PathEscape(domain))
+	body, err := httpGet(ctx, apiURL, 30*time.Second, nil)
 	if err != nil {
 		return nil, fmt.Errorf("anubis: %w", err)
 	}
 
-	// Response is a JSON array of strings
 	var subs []string
 	if err := json.Unmarshal(body, &subs); err != nil {
 		return nil, fmt.Errorf("anubis decode: %w", err)
@@ -315,14 +342,18 @@ type otxResponse struct {
 	} `json:"passive_dns"`
 }
 
-// QueryAlienVault queries the AlienVault OTX passive DNS API.
-// The /indicators/domain endpoint is publicly accessible without an API key.
+// QueryAlienVault queries the AlienVault OTX passive DNS API. OTX no longer
+// serves this endpoint anonymously, so OTX_API_KEY must be set.
 func QueryAlienVault(ctx context.Context, domain string) ([]string, error) {
+	key := os.Getenv("OTX_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("alienvault: %w (set OTX_API_KEY)", ErrAPIKeyRequired)
+	}
 	apiURL := fmt.Sprintf(
 		"https://otx.alienvault.com/api/v1/indicators/domain/%s/passive_dns",
 		url.PathEscape(domain),
 	)
-	body, err := httpGet(ctx, apiURL, 30*time.Second)
+	body, err := httpGet(ctx, apiURL, 45*time.Second, map[string]string{"X-OTX-API-KEY": key})
 	if err != nil {
 		return nil, fmt.Errorf("alienvault: %w", err)
 	}
@@ -334,9 +365,7 @@ func QueryAlienVault(ctx context.Context, domain string) ([]string, error) {
 
 	var subs []string
 	for _, entry := range resp.PassiveDNS {
-		if entry.Hostname != "" {
-			subs = append(subs, entry.Hostname)
-		}
+		subs = append(subs, entry.Hostname)
 	}
 	return filterSubdomains(domain, subs), nil
 }
@@ -344,37 +373,57 @@ func QueryAlienVault(ctx context.Context, domain string) ([]string, error) {
 // ─── Source: CertSpotter ─────────────────────────────────────────────────────
 
 type certSpotterEntry struct {
+	ID       string   `json:"id"`
 	DNSNames []string `json:"dns_names"`
 }
 
-// QueryCertSpotter queries the CertSpotter CT log API (sslmate.com).
-// 100 req/hour free, no key required for basic queries.
+// certSpotterMaxPages bounds pagination; anonymous use allows ~100 requests/hour.
+const certSpotterMaxPages = 5
+
+// QueryCertSpotter queries the CertSpotter CT log API (sslmate.com), following
+// pagination. CERTSPOTTER_API_KEY raises the rate limit if set.
 func QueryCertSpotter(ctx context.Context, domain string) ([]string, error) {
-	apiURL := fmt.Sprintf(
-		"https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names",
-		url.QueryEscape(domain),
-	)
-	body, err := httpGet(ctx, apiURL, 30*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("certspotter: %w", err)
+	var headers map[string]string
+	if key := os.Getenv("CERTSPOTTER_API_KEY"); key != "" {
+		headers = map[string]string{"Authorization": "Bearer " + key}
 	}
 
-	var entries []certSpotterEntry
-	if err := json.Unmarshal(body, &entries); err != nil {
-		return nil, fmt.Errorf("certspotter decode: %w", err)
-	}
-
-	seen := make(map[string]struct{})
-	var subs []string
-	for _, e := range entries {
-		for _, name := range e.DNSNames {
-			name = strings.ToLower(strings.TrimSpace(name))
-			name = strings.TrimPrefix(name, "*.")
-			if _, ok := seen[name]; !ok {
-				seen[name] = struct{}{}
-				subs = append(subs, name)
-			}
+	var names []string
+	after := ""
+	for page := 0; page < certSpotterMaxPages; page++ {
+		apiURL := fmt.Sprintf(
+			"https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names",
+			url.QueryEscape(domain),
+		)
+		if after != "" {
+			apiURL += "&after=" + url.QueryEscape(after)
 		}
+		body, err := httpGet(ctx, apiURL, 30*time.Second, headers)
+		if err != nil {
+			if page > 0 {
+				break // keep what earlier pages returned
+			}
+			return nil, fmt.Errorf("certspotter: %w", err)
+		}
+
+		var entries []certSpotterEntry
+		if err := json.Unmarshal(body, &entries); err != nil {
+			return nil, fmt.Errorf("certspotter decode: %w", err)
+		}
+		for _, e := range entries {
+			names = append(names, e.DNSNames...)
+		}
+		if len(entries) == 0 {
+			break
+		}
+		after = entries[len(entries)-1].ID
 	}
-	return filterSubdomains(domain, subs), nil
+	return filterSubdomains(domain, names), nil
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

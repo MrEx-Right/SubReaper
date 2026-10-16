@@ -13,12 +13,13 @@ type JSONReporter struct{}
 
 // jsonOutput is the top-level JSON structure written by JSONReporter.
 type jsonOutput struct {
-	Target    string        `json:"target,omitempty"`
-	StartedAt time.Time     `json:"started_at"`
-	Duration  string        `json:"duration"`
-	Stats     jsonStats     `json:"stats"`
-	Findings  []jsonFinding `json:"findings"`
-	Errors    []jsonError   `json:"errors,omitempty"`
+	Target      string        `json:"target,omitempty"`
+	StartedAt   time.Time     `json:"started_at"`
+	Duration    string        `json:"duration"`
+	Stats       jsonStats     `json:"stats"`
+	Interrupted bool          `json:"interrupted,omitempty"`
+	Findings    []jsonFinding `json:"findings"`
+	Errors      []jsonError   `json:"errors,omitempty"`
 }
 
 type jsonStats struct {
@@ -33,6 +34,10 @@ type jsonFinding struct {
 	Type         string        `json:"type"`
 	Chain        []jsonHop     `json:"dns_chain,omitempty"`
 	Provider     *jsonProvider `json:"provider,omitempty"`
+	IPs          []string      `json:"ips,omitempty"`
+	HTTP         []jsonProbe   `json:"http,omitempty"`
+	Technologies []string      `json:"technologies,omitempty"`
+	TXTRecords   []jsonTXT     `json:"txt_records,omitempty"`
 	Description  string        `json:"description,omitempty"`
 	Remediation  string        `json:"remediation,omitempty"`
 	DiscoveredAt time.Time     `json:"discovered_at"`
@@ -48,10 +53,27 @@ type jsonHop struct {
 
 type jsonProvider struct {
 	Name          string       `json:"name"`
+	Status        string       `json:"status,omitempty"`
 	Confidence    int          `json:"confidence"`
+	Identified    bool         `json:"identified"`
 	ClaimVerified bool         `json:"claim_verified"`
 	Signals       []jsonSignal `json:"signals"`
 	Writeup       string       `json:"writeup,omitempty"`
+	ClaimURL      string       `json:"claim_url,omitempty"`
+}
+
+type jsonProbe struct {
+	URL        string `json:"url"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Server     string `json:"server,omitempty"`
+	TLSSubject string `json:"tls_subject,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+type jsonTXT struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+	Issue string `json:"issue,omitempty"`
 }
 
 type jsonSignal struct {
@@ -69,8 +91,9 @@ type jsonError struct {
 // Write serializes the ScanResult to JSON.
 func (r *JSONReporter) Write(w io.Writer, result *models.ScanResult) error {
 	out := jsonOutput{
-		StartedAt: result.StartedAt,
-		Duration:  result.Duration.String(),
+		StartedAt:   result.StartedAt,
+		Duration:    result.Duration.String(),
+		Interrupted: result.Interrupted,
 	}
 
 	// Stats
@@ -108,9 +131,12 @@ func (r *JSONReporter) Write(w io.Writer, result *models.ScanResult) error {
 		if f.Provider != nil && f.Provider.ProviderName != "" {
 			jp := &jsonProvider{
 				Name:          f.Provider.ProviderName,
+				Status:        string(f.Provider.Status),
 				Confidence:    f.Provider.Confidence,
+				Identified:    f.Provider.IsIdentified(),
 				ClaimVerified: f.Provider.ClaimVerified,
 				Writeup:       f.Provider.TakeoverWriteup,
+				ClaimURL:      f.Provider.ClaimURL,
 			}
 			for _, s := range f.Provider.Signals {
 				jp.Signals = append(jp.Signals, jsonSignal{
@@ -120,6 +146,25 @@ func (r *JSONReporter) Write(w io.Writer, result *models.ScanResult) error {
 				})
 			}
 			jf.Provider = jp
+		}
+		for _, ip := range f.IPs {
+			jf.IPs = append(jf.IPs, ip.String())
+		}
+		for _, p := range f.HTTPProbes {
+			if p == nil {
+				continue
+			}
+			jf.HTTP = append(jf.HTTP, jsonProbe{
+				URL:        p.URL,
+				StatusCode: p.StatusCode,
+				Server:     p.Header("Server"),
+				TLSSubject: p.TLSSubject,
+				Error:      p.Error,
+			})
+		}
+		jf.Technologies = f.Technologies
+		for _, t := range f.TXTRecords {
+			jf.TXTRecords = append(jf.TXTRecords, jsonTXT{Kind: t.Kind, Value: t.Raw, Issue: t.Issue})
 		}
 		out.Findings = append(out.Findings, jf)
 	}

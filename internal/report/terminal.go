@@ -12,6 +12,7 @@ import (
 // TerminalReporter produces rich, colored terminal output.
 type TerminalReporter struct {
 	NoColor bool
+	Verbose bool // list scan errors
 }
 
 // severity color map
@@ -49,7 +50,17 @@ func (r *TerminalReporter) Write(w io.Writer, result *models.ScanResult) error {
 	dim.Fprintf(w, "  Domains   : %d scanned\n", result.Stats.DomainsScanned)
 	dim.Fprintf(w, "  Findings  : %d total\n", result.Stats.FindingsTotal)
 	if len(result.Errors) > 0 {
-		dim.Fprintf(w, "  Errors    : %d (use -v for details)\n", len(result.Errors))
+		if r.Verbose {
+			dim.Fprintf(w, "  Errors    : %d\n", len(result.Errors))
+			for _, e := range result.Errors {
+				dim.Fprintf(w, "    - %s: %s\n", e.Domain, e.Message)
+			}
+		} else {
+			dim.Fprintf(w, "  Errors    : %d (use -v for details)\n", len(result.Errors))
+		}
+	}
+	if result.Interrupted {
+		color.New(color.FgYellow).Fprintf(w, "  Status    : interrupted, partial results\n")
 	}
 	fmt.Fprintln(w)
 
@@ -122,11 +133,30 @@ func (r *TerminalReporter) Write(w io.Writer, result *models.ScanResult) error {
 				}
 			}
 
+			if len(f.IPs) > 0 {
+				dim.Fprintf(w, "  ├─ IPs           : %s\n", joinIPs(f))
+			}
+			if s := probeSummary(f); s != "" {
+				dim.Fprintf(w, "  ├─ HTTP          : %s\n", s)
+			}
+			if len(f.Technologies) > 0 {
+				dim.Fprintf(w, "  ├─ Technologies  : %s\n", strings.Join(f.Technologies, ", "))
+			}
+			for _, t := range f.TXTRecords {
+				if t.Kind == "spf" || t.Kind == "dmarc" {
+					dim.Fprintf(w, "  ├─ %-14s: %s\n", strings.ToUpper(t.Kind), t.Raw)
+				}
+			}
+
 			// Provider
 			if f.Provider != nil && f.Provider.IsIdentified() {
-				cyan.Fprintf(w, "  ├─ Provider      : %s (confidence: %d%%)\n",
+				status := ""
+				if f.Provider.Status != "" {
+					status = ", " + strings.ReplaceAll(string(f.Provider.Status), "_", " ")
+				}
+				cyan.Fprintf(w, "  ├─ Provider      : %s (confidence: %d%%%s)\n",
 					bold.Sprint(f.Provider.ProviderName),
-					f.Provider.Confidence,
+					f.Provider.Confidence, status,
 				)
 				if f.Provider.ClaimVerified {
 					color.New(color.BgRed, color.FgHiWhite, color.Bold).Fprintf(w, "  ├─ [TAKEOVER READY] RESOURCE IS UNCLAIMED AND VULNERABLE \n")
@@ -174,26 +204,6 @@ func (r *TerminalReporter) Write(w io.Writer, result *models.ScanResult) error {
 	return nil
 }
 
-// PrintBanner prints the SubReaper ASCII banner to the writer.
-func PrintBanner(w io.Writer, noColor bool) {
-	if noColor {
-		color.NoColor = true
-	}
-	red := color.New(color.FgRed, color.Bold)
-	dim := color.New(color.Faint)
-
-	red.Fprintln(w, `
-   ▄▄▄▄▄   ▄   ███   █▄▄▄▄ ▄███▄   ██   █ ▄▄  ▄███▄   █▄▄▄▄ 
-  █     ▀▄  █  █  █  █  ▄▀ █▀   ▀  █ █  █   █ █▀   ▀  █  ▄▀ 
-▄  ▀▀▀▀▄ █   █ █ ▀ ▄ █▀▀▌  ██▄▄    █▄▄█ █▀▀▀  ██▄▄    █▀▀▌  
- ▀▄▄▄▄▀  █   █ █  ▄▀ █  █  █▄   ▄▀ █  █ █     █▄   ▄▀ █  █  
-         █▄ ▄█ ███     █   ▀███▀      █  █    ▀███▀     █   
-          ▀▀▀         ▀              █    ▀            ▀    
-                                    ▀                       `)
-	dim.Fprintln(w, "  Subdomain Takeover Scanner — github.com/MrEx-Right/SubReaper")
-	fmt.Fprintln(w)
-}
-
 // groupBySeverity groups findings into a map keyed by Severity.
 func groupBySeverity(findings []*models.Finding) map[models.Severity][]*models.Finding {
 	grouped := make(map[models.Severity][]*models.Finding)
@@ -201,6 +211,27 @@ func groupBySeverity(findings []*models.Finding) map[models.Severity][]*models.F
 		grouped[f.Severity] = append(grouped[f.Severity], f)
 	}
 	return grouped
+}
+
+// joinIPs formats the resolved IPs of a finding.
+func joinIPs(f *models.Finding) string {
+	parts := make([]string, 0, len(f.IPs))
+	for _, ip := range f.IPs {
+		parts = append(parts, ip.String())
+	}
+	return strings.Join(parts, ", ")
+}
+
+// probeSummary formats "url → status" for each HTTP probe that answered.
+func probeSummary(f *models.Finding) string {
+	var parts []string
+	for _, p := range f.HTTPProbes {
+		if p == nil || p.Error != "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s → %d", p.URL, p.StatusCode))
+	}
+	return strings.Join(parts, " | ")
 }
 
 // formatSignals returns a compact one-liner of signal type names.

@@ -2,13 +2,18 @@
 // and the Registry that groups them together.
 //
 // All definitions live in this single package to avoid import cycles.
+//
+// Status values and unclaimed-resource fingerprints follow
+// https://github.com/EdOverflow/can-i-take-over-xyz.
 package providers
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,23 +29,37 @@ type HeaderMatch struct {
 	Contains string // Substring the header value must contain (empty = presence only)
 }
 
-// BodySignal describes a body substring that may indicate a specific provider's
-// error page. Body signals are lowest-priority evidence and are never sufficient
-// alone for a confirmed match.
+// BodySignal describes a body substring that appears on a provider's
+// "unclaimed resource" page. Body signals are evidence that the resource is
+// unclaimed, but they are never sufficient alone for a match: the CNAME must
+// also point at the provider.
 type BodySignal struct {
 	Contains   string
 	CaseInsens bool
 }
 
-// ClaimCheckFn is a function that actively verifies whether a resource at the
-// given dangling CNAME endpoint is available to claim.
-type ClaimCheckFn func(ctx context.Context, cname string) (bool, error)
+// CheckEnv carries the network helpers a claim check may use, so checks use
+// the scanner's own resolvers and timeouts.
+type CheckEnv struct {
+	// IsNXDOMAIN reports whether host returns NXDOMAIN. Resolution errors
+	// must be returned as errors.
+	IsNXDOMAIN func(ctx context.Context, host string) (bool, error)
+	// HTTP is the client used for HTTP checks. Redirects are not followed.
+	HTTP *http.Client
+}
+
+// ClaimCheckFn actively verifies whether the resource behind cname is
+// available to claim. Any network error must be returned as an error and
+// never reported as claimable.
+type ClaimCheckFn func(ctx context.Context, env *CheckEnv, cname string) (bool, error)
 
 // Provider defines all detection signals and verification logic for a single
 // cloud service known to be vulnerable to subdomain takeover.
 type Provider struct {
 	Name            string
+	Status          models.ProviderStatus
 	CNAMESuffixes   []string
+	CNAMEPatterns   []*regexp.Regexp
 	IPRanges        []*net.IPNet
 	TLSCertContains []string
 	Headers         []HeaderMatch
@@ -62,12 +81,18 @@ func (p *Provider) Score(signals []models.Signal) int {
 	return total
 }
 
-// MatchCNAME checks whether the CNAME value matches any known suffix.
+// MatchCNAME checks whether the CNAME value matches any known suffix or pattern.
+// It returns the matched suffix/pattern, or "".
 func (p *Provider) MatchCNAME(cname string) string {
-	lower := strings.ToLower(cname)
+	lower := strings.ToLower(strings.TrimSuffix(cname, "."))
 	for _, suffix := range p.CNAMESuffixes {
 		if strings.HasSuffix(lower, strings.ToLower(suffix)) {
 			return suffix
+		}
+	}
+	for _, re := range p.CNAMEPatterns {
+		if re.MatchString(lower) {
+			return re.String()
 		}
 	}
 	return ""
@@ -104,14 +129,18 @@ func (p *Provider) MatchHeader(headers map[string][]string) []string {
 // MatchBody checks provider body signals against a response body string.
 func (p *Provider) MatchBody(body string) []string {
 	var matched []string
+	lowerBody := ""
 	for _, bs := range p.BodySignals {
-		haystack := body
-		needle := bs.Contains
 		if bs.CaseInsens {
-			haystack = strings.ToLower(haystack)
-			needle = strings.ToLower(needle)
+			if lowerBody == "" {
+				lowerBody = strings.ToLower(body)
+			}
+			if strings.Contains(lowerBody, strings.ToLower(bs.Contains)) {
+				matched = append(matched, bs.Contains)
+			}
+			continue
 		}
-		if strings.Contains(haystack, needle) {
+		if strings.Contains(body, bs.Contains) {
 			matched = append(matched, bs.Contains)
 		}
 	}
@@ -137,6 +166,29 @@ func (r *Registry) All() []*Provider { return r.providers }
 // Len returns the number of registered providers.
 func (r *Registry) Len() int { return len(r.providers) }
 
+// Get returns the provider with the given name, or nil.
+func (r *Registry) Get(name string) *Provider {
+	for _, p := range r.providers {
+		if strings.EqualFold(p.Name, name) {
+			return p
+		}
+	}
+	return nil
+}
+
+// MatchAnyCNAME reports whether any of the CNAME targets belongs to a
+// registered provider.
+func (r *Registry) MatchAnyCNAME(targets []string) bool {
+	for _, t := range targets {
+		for _, p := range r.providers {
+			if p.MatchCNAME(t) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // DefaultRegistry returns a registry pre-loaded with all known providers.
 func DefaultRegistry() *Registry {
 	r := NewRegistry()
@@ -146,67 +198,146 @@ func DefaultRegistry() *Registry {
 	return r
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Claim-check helpers ──────────────────────────────────────────────────────
 
-func parseCIDRs(cidrs []string) []*net.IPNet {
-	var nets []*net.IPNet
-	for _, cidr := range cidrs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err == nil {
-			nets = append(nets, ipNet)
-		}
+const claimBodyLimit = 64 * 1024
+
+// DefaultHTTPClient returns the client used for claim checks.
+func DefaultHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 8 * time.Second
 	}
-	return nets
-}
-
-func dnsNXDomainCheck(ctx context.Context, cname string) (bool, error) {
-	addrs, err := net.DefaultResolver.LookupHost(ctx, cname)
-	if err != nil {
-		return true, nil
-	}
-	return len(addrs) == 0, nil
-}
-
-func httpGetCheck(ctx context.Context, url string, expectedStatus int) (bool, error) {
-	client := &http.Client{
-		Timeout: 8 * time.Second,
+	return &http.Client{
+		Timeout: timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// fetch performs a GET and returns the status code and a bounded body.
+func fetch(ctx context.Context, env *CheckEnv, url string) (int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("User-Agent", "SubReaper/2.0 (+https://github.com/MrEx-Right/SubReaper)")
+	resp, err := env.HTTP.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, claimBodyLimit))
+	if err != nil {
+		return resp.StatusCode, "", err
+	}
+	return resp.StatusCode, string(body), nil
+}
+
+// nxClaim returns a check that is positive only when cname returns NXDOMAIN
+// and ends in one of the given suffixes (names under those suffixes can be
+// registered by anyone).
+func nxClaim(suffixes ...string) ClaimCheckFn {
+	return func(ctx context.Context, env *CheckEnv, cname string) (bool, error) {
+		lower := strings.ToLower(cname)
+		ok := false
+		for _, s := range suffixes {
+			if strings.HasSuffix(lower, s) {
+				ok = true
+				break
+			}
+		}
+		if !ok || env == nil || env.IsNXDOMAIN == nil {
+			return false, nil
+		}
+		return env.IsNXDOMAIN(ctx, cname)
+	}
+}
+
+// bodyClaim returns a check that requests the CNAME target itself (HTTPS
+// first, then HTTP) and is positive only when the provider's unclaimed-name
+// page is served for it. This fits providers with wildcard DNS, where the
+// target always resolves and only the response shows the name is free.
+func bodyClaim(markers ...string) ClaimCheckFn {
+	return func(ctx context.Context, env *CheckEnv, cname string) (bool, error) {
+		if env == nil || env.HTTP == nil {
+			return false, nil
+		}
+		var lastErr error
+		for _, scheme := range []string{"https://", "http://"} {
+			_, body, err := fetch(ctx, env, scheme+cname+"/")
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			for _, m := range markers {
+				if strings.Contains(body, m) {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+		return false, lastErr
+	}
+}
+
+var s3Suffix = regexp.MustCompile(`\.(s3|s3-website|s3-external-1)([.-][a-z0-9-]+)?(\.dualstack)?(\.[a-z0-9-]+)?\.amazonaws\.com$`)
+
+// s3Claim checks whether the bucket named by the CNAME target exists.
+func s3Claim(ctx context.Context, env *CheckEnv, cname string) (bool, error) {
+	lower := strings.ToLower(cname)
+	loc := s3Suffix.FindStringIndex(lower)
+	if loc == nil || loc[0] == 0 || env == nil || env.HTTP == nil {
+		return false, nil
+	}
+	bucket := lower[:loc[0]]
+	status, body, err := fetch(ctx, env, "https://s3.amazonaws.com/"+bucket+"/")
 	if err != nil {
 		return false, err
 	}
-	req.Header.Set("User-Agent", "SubReaper-Scanner")
-	resp, err := client.Do(req)
+	return status == http.StatusNotFound && strings.Contains(body, "NoSuchBucket"), nil
+}
+
+// githubClaim checks whether the GitHub account behind <user>.github.io exists.
+// A missing account means anyone can register it and publish the site.
+func githubClaim(ctx context.Context, env *CheckEnv, cname string) (bool, error) {
+	lower := strings.ToLower(strings.TrimSuffix(cname, "."))
+	user := strings.TrimSuffix(lower, ".github.io")
+	if user == lower || user == "" || strings.Contains(user, ".") || env == nil || env.HTTP == nil {
+		return false, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/users/"+user, nil)
 	if err != nil {
-		return true, nil
+		return false, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "SubReaper/2.0")
+	resp, err := env.HTTP.Do(req)
+	if err != nil {
+		return false, err
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == expectedStatus, nil
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return true, nil
+	case http.StatusOK:
+		return false, nil
+	default:
+		return false, fmt.Errorf("github api returned HTTP %d", resp.StatusCode)
+	}
 }
 
 // ── Provider Definitions ─────────────────────────────────────────────────────
+
+const xyz = "https://github.com/EdOverflow/can-i-take-over-xyz"
 
 func allProviders() []*Provider {
 	return []*Provider{
 		// ── AWS ──────────────────────────────────────────────────────────────
 		{
-			Name: "AWS S3",
-			CNAMESuffixes: []string{
-				".s3.amazonaws.com",
-				".s3-website.us-east-1.amazonaws.com",
-				".s3-website.us-east-2.amazonaws.com",
-				".s3-website.us-west-1.amazonaws.com",
-				".s3-website.us-west-2.amazonaws.com",
-				".s3-website.eu-west-1.amazonaws.com",
-				".s3-website.eu-central-1.amazonaws.com",
-				".s3-website.ap-southeast-1.amazonaws.com",
-				".s3-website.ap-northeast-1.amazonaws.com",
-				".s3-website-us-east-1.amazonaws.com",
-				".s3-website-eu-west-1.amazonaws.com",
-			},
+			Name:          "AWS S3",
+			Status:        models.StatusVulnerable,
+			CNAMEPatterns: []*regexp.Regexp{s3Suffix},
 			Headers: []HeaderMatch{
 				{Key: "x-amz-request-id"},
 				{Key: "x-amz-id-2"},
@@ -216,92 +347,61 @@ func allProviders() []*Provider {
 				{Contains: "NoSuchBucket"},
 				{Contains: "The specified bucket does not exist"},
 			},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				parts := strings.Split(strings.ToLower(cname), ".")
-				if len(parts) < 3 {
-					return false, nil
-				}
-				bucketName := parts[0]
-				if bucketName == "" {
-					return false, nil
-				}
-				return httpGetCheck(ctx, fmt.Sprintf("https://%s.s3.amazonaws.com/", bucketName), http.StatusNotFound)
-			},
+			ClaimCheck:  s3Claim,
 			TakeoverDoc: "https://hackerone.com/reports/207477",
 			ClaimURL:    "https://s3.console.aws.amazon.com/s3/home",
 		},
 		{
+			Name:          "AWS Elastic Beanstalk",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".elasticbeanstalk.com"},
+			ClaimCheck:    nxClaim(".elasticbeanstalk.com"),
+			TakeoverDoc:   xyz,
+			ClaimURL:      "https://console.aws.amazon.com/elasticbeanstalk/home",
+		},
+		{
 			Name:          "AWS CloudFront",
+			Status:        models.StatusNotVulnerable,
 			CNAMESuffixes: []string{".cloudfront.net"},
 			Headers: []HeaderMatch{
 				{Key: "x-cache", Contains: "cloudfront"},
 				{Key: "via", Contains: "cloudfront"},
 				{Key: "x-amz-cf-id"},
 			},
-			BodySignals: []BodySignal{
-				{Contains: "ERROR: The request could not be satisfied"},
-				{Contains: "CloudFront wasn't able to connect to the origin"},
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-			ClaimURL:    "https://console.aws.amazon.com/cloudfront/home",
-		},
-		{
-			Name:          "AWS Elastic Beanstalk",
-			CNAMESuffixes: []string{".elasticbeanstalk.com"},
-			BodySignals:   []BodySignal{{Contains: "No Application"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			TakeoverDoc: xyz,
 		},
 
 		// ── Azure ─────────────────────────────────────────────────────────────
 		{
-			Name:          "Azure Web Apps",
-			CNAMESuffixes: []string{".azurewebsites.net", ".cloudapp.net", ".cloudapp.azure.com"},
-			Headers: []HeaderMatch{
-				{Key: "x-ms-request-id"},
-				{Key: "x-powered-by", Contains: "ASP.NET"},
-			},
-			BodySignals: []BodySignal{
-				{Contains: "404 Web Site not found"},
-				{Contains: "Microsoft Azure App Service"},
-			},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				if !strings.HasSuffix(strings.ToLower(cname), ".azurewebsites.net") {
-					return false, nil
-				}
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name: "Azure Blob Storage",
+			Name:   "Microsoft Azure",
+			Status: models.StatusVulnerable,
 			CNAMESuffixes: []string{
-				".blob.core.windows.net",
-				".z1.web.core.windows.net", ".z2.web.core.windows.net",
-				".z3.web.core.windows.net", ".z4.web.core.windows.net",
-				".z5.web.core.windows.net", ".z13.web.core.windows.net",
-				".z22.web.core.windows.net",
+				".azurewebsites.net", ".cloudapp.net", ".cloudapp.azure.com",
+				".trafficmanager.net", ".blob.core.windows.net", ".azure-api.net",
+				".azurehdinsight.net", ".azurecontainer.io", ".database.windows.net",
+				".azuredatalakestore.net", ".search.windows.net", ".redis.cache.windows.net",
+				".servicebus.windows.net", ".visualstudio.com", ".azurefd.net",
 			},
 			Headers: []HeaderMatch{
 				{Key: "x-ms-request-id"},
 				{Key: "x-ms-version"},
 			},
 			BodySignals: []BodySignal{
-				{Contains: "BlobNotFound"},
-				{Contains: "ContainerNotFound"},
-				{Contains: "The specified container does not exist"},
+				{Contains: "404 Web Site not found"},
 			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Azure Traffic Manager",
-			CNAMESuffixes: []string{".trafficmanager.net"},
-			BodySignals:   []BodySignal{{Contains: "Error 404 - Not found", CaseInsens: true}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			ClaimCheck: nxClaim(
+				".azurewebsites.net", ".cloudapp.net", ".cloudapp.azure.com",
+				".trafficmanager.net", ".blob.core.windows.net", ".azure-api.net",
+				".azurecontainer.io", ".azurefd.net",
+			),
+			TakeoverDoc: xyz,
+			ClaimURL:    "https://portal.azure.com/",
 		},
 
 		// ── GitHub ────────────────────────────────────────────────────────────
 		{
 			Name:          "GitHub Pages",
+			Status:        models.StatusEdgeCase,
 			CNAMESuffixes: []string{".github.io"},
 			Headers: []HeaderMatch{
 				{Key: "server", Contains: "GitHub.com"},
@@ -310,38 +410,16 @@ func allProviders() []*Provider {
 			BodySignals: []BodySignal{
 				{Contains: "There isn't a GitHub Pages site here"},
 			},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				lower := strings.ToLower(cname)
-				trimmed := strings.TrimSuffix(strings.TrimSuffix(lower, "."), ".github.io")
-				if strings.Contains(trimmed, ".") {
-					return false, nil
-				}
-				if trimmed == "" {
-					return false, nil
-				}
-				client := &http.Client{Timeout: 8 * time.Second}
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-					"https://api.github.com/users/"+trimmed, nil)
-				if err != nil {
-					return false, err
-				}
-				req.Header.Set("Accept", "application/vnd.github.v3+json")
-				req.Header.Set("User-Agent", "SubReaper-Scanner")
-				resp, err := client.Do(req)
-				if err != nil {
-					return false, err
-				}
-				defer resp.Body.Close()
-				return resp.StatusCode == http.StatusNotFound, nil
-			},
-			TakeoverDoc: "https://hackerone.com/reports/263902",
+			ClaimCheck:  githubClaim,
+			TakeoverDoc: xyz,
 			ClaimURL:    "https://github.com/new",
 		},
 
-		// ── Heroku ────────────────────────────────────────────────────────────
+		// ── Modern hosting ────────────────────────────────────────────────────
 		{
 			Name:          "Heroku",
-			CNAMESuffixes: []string{".herokuapp.com", ".herokussl.com"},
+			Status:        models.StatusEdgeCase,
+			CNAMESuffixes: []string{".herokuapp.com", ".herokussl.com", ".herokudns.com"},
 			Headers: []HeaderMatch{
 				{Key: "via", Contains: "heroku"},
 				{Key: "x-heroku-error-id"},
@@ -350,283 +428,354 @@ func allProviders() []*Provider {
 				{Contains: "No such app"},
 				{Contains: "herokucdn.com/error-pages/no-such-app.html"},
 			},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
+			ClaimCheck: func(ctx context.Context, env *CheckEnv, cname string) (bool, error) {
+				// Only *.herokuapp.com app names can be re-registered;
+				// herokudns.com targets are random and bound to an account.
 				if !strings.HasSuffix(strings.ToLower(cname), ".herokuapp.com") {
 					return false, nil
 				}
-				client := &http.Client{
-					Timeout: 8 * time.Second,
-					CheckRedirect: func(req *http.Request, via []*http.Request) error {
-						return http.ErrUseLastResponse
-					},
-				}
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+cname, nil)
-				if err != nil {
-					return false, err
-				}
-				req.Header.Set("User-Agent", "SubReaper-Scanner")
-				resp, err := client.Do(req)
-				if err != nil {
-					return true, nil
-				}
-				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusNotFound {
-					via := strings.ToLower(resp.Header.Get("Via"))
-					server := strings.ToLower(resp.Header.Get("Server"))
-					return strings.Contains(via, "heroku") || strings.Contains(server, "heroku"), nil
-				}
-				return false, nil
+				return bodyClaim("no-such-app", "No such app")(ctx, env, cname)
 			},
-			TakeoverDoc: "https://hackerone.com/reports/340139",
+			TakeoverDoc: xyz,
 			ClaimURL:    "https://dashboard.heroku.com/new-app",
 		},
-
-		// ── Modern Hosting ────────────────────────────────────────────────────
 		{
 			Name:          "Netlify",
+			Status:        models.StatusEdgeCase,
 			CNAMESuffixes: []string{".netlify.app", ".netlify.com"},
 			Headers: []HeaderMatch{
 				{Key: "server", Contains: "Netlify"},
 				{Key: "x-nf-request-id"},
 			},
-			BodySignals: []BodySignal{
-				{Contains: "Not Found - Request ID"},
-			},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				lower := strings.ToLower(cname)
-				if !strings.HasSuffix(lower, ".netlify.app") && !strings.HasSuffix(lower, ".netlify.com") {
-					return false, nil
-				}
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
+			BodySignals: []BodySignal{{Contains: "Not Found - Request ID"}},
+			ClaimCheck:  bodyClaim("Not Found - Request ID"),
+			TakeoverDoc: xyz,
 			ClaimURL:    "https://app.netlify.com/",
 		},
 		{
 			Name:          "Vercel",
+			Status:        models.StatusEdgeCase,
 			CNAMESuffixes: []string{".vercel.app", ".now.sh"},
 			Headers: []HeaderMatch{
 				{Key: "server", Contains: "Vercel"},
 				{Key: "x-vercel-id"},
 			},
 			BodySignals: []BodySignal{
+				{Contains: "DEPLOYMENT_NOT_FOUND"},
 				{Contains: "The deployment could not be found"},
 			},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				if !strings.HasSuffix(strings.ToLower(cname), ".vercel.app") {
-					return false, nil
-				}
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
+			ClaimCheck:  bodyClaim("DEPLOYMENT_NOT_FOUND"),
+			TakeoverDoc: xyz,
 			ClaimURL:    "https://vercel.com/new",
 		},
 		{
 			Name:          "Render",
+			Status:        models.StatusEdgeCase,
 			CNAMESuffixes: []string{".onrender.com"},
-			Headers:       []HeaderMatch{{Key: "server", Contains: "Render"}},
+			Headers:       []HeaderMatch{{Key: "x-render-origin-server"}},
 			BodySignals:   []BodySignal{{Contains: "service not found", CaseInsens: true}},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				return httpGetCheck(ctx, "https://"+cname, http.StatusNotFound)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
+			TakeoverDoc:   xyz,
 		},
 		{
 			Name:          "Fly.io",
+			Status:        models.StatusNotVulnerable,
 			CNAMESuffixes: []string{".fly.dev"},
 			Headers:       []HeaderMatch{{Key: "fly-request-id"}},
-			BodySignals:   []BodySignal{{Contains: "app not found", CaseInsens: true}},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				if !strings.HasSuffix(strings.ToLower(cname), ".fly.dev") {
-					return false, nil
-				}
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
+			TakeoverDoc:   xyz,
 		},
 		{
-			Name:          "DigitalOcean App Platform",
+			Name:          "Digital Ocean",
+			Status:        models.StatusVulnerable,
 			CNAMESuffixes: []string{".ondigitalocean.app"},
-			BodySignals:   []BodySignal{{Contains: "domain is not configured", CaseInsens: true}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			BodySignals:   []BodySignal{{Contains: "Domain uses DO name servers with no records in DO."}},
+			TakeoverDoc:   xyz,
 		},
 		{
 			Name:          "Webflow",
-			CNAMESuffixes: []string{".webflow.io"},
-			Headers:       []HeaderMatch{{Key: "x-wf-request-id"}},
-			BodySignals:   []BodySignal{{Contains: "This site is not available"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			Status:        models.StatusEdgeCase,
+			CNAMESuffixes: []string{".webflow.io", "proxy-ssl.webflow.com", "proxy.webflow.com"},
+			Headers:       []HeaderMatch{{Key: "x-wf-region"}},
+			BodySignals: []BodySignal{
+				{Contains: "The page you are looking for doesn't exist or has been moved."},
+			},
+			TakeoverDoc: xyz,
 		},
 		{
 			Name:          "Firebase Hosting",
+			Status:        models.StatusNotVulnerable,
 			CNAMESuffixes: []string{".web.app", ".firebaseapp.com"},
-			Headers:       []HeaderMatch{{Key: "server", Contains: "Firebase"}},
-			BodySignals:   []BodySignal{{Contains: "Site Not Found"}},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				lower := strings.ToLower(cname)
-				if !strings.HasSuffix(lower, ".web.app") && !strings.HasSuffix(lower, ".firebaseapp.com") {
-					return false, nil
-				}
-				return dnsNXDomainCheck(ctx, cname)
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Surge.sh",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".surge.sh", "na-west1.surge.sh"},
+			BodySignals:   []BodySignal{{Contains: "project not found"}},
+			ClaimCheck:    bodyClaim("project not found"),
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Pantheon",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".pantheonsite.io"},
+			BodySignals: []BodySignal{
+				{Contains: "404 error unknown site!"},
+				{Contains: "The gods are wise, but do not know of the site which you seek"},
 			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
+			TakeoverDoc: xyz,
+		},
+		{
+			Name:          "Read the Docs",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".readthedocs.io", ".readthedocs.org"},
+			BodySignals: []BodySignal{
+				{Contains: "The link you have followed or the URL that you entered does not exist."},
+				{Contains: "Unknown Project"},
+			},
+			TakeoverDoc: xyz,
+		},
+		{
+			Name:          "Bitbucket",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".bitbucket.io"},
+			BodySignals:   []BodySignal{{Contains: "Repository not found"}},
+			ClaimCheck:    bodyClaim("Repository not found"),
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Fastly",
+			Status:        models.StatusNotVulnerable,
+			CNAMESuffixes: []string{".global.prod.fastly.net", ".fastly.net", ".fastlylb.net"},
+			Headers:       []HeaderMatch{{Key: "x-fastly-request-id"}},
+			TakeoverDoc:   xyz,
 		},
 
 		// ── SaaS / CMS ────────────────────────────────────────────────────────
 		{
 			Name:          "Shopify",
-			CNAMESuffixes: []string{".myshopify.com"},
-			Headers: []HeaderMatch{
-				{Key: "x-shopid"},
-				{Key: "x-shopify-stage"},
-			},
+			Status:        models.StatusEdgeCase,
+			CNAMESuffixes: []string{".myshopify.com", "shops.myshopify.com"},
+			Headers:       []HeaderMatch{{Key: "x-shopid"}, {Key: "x-shopify-stage"}},
 			BodySignals: []BodySignal{
-				{Contains: "Sorry, this shop is currently unavailable"},
+				{Contains: "Sorry, this shop is currently unavailable."},
 			},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				return httpGetCheck(ctx, "https://"+cname, http.StatusNotFound)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
+			TakeoverDoc: xyz,
 			ClaimURL:    "https://accounts.shopify.com/store-login",
 		},
 		{
 			Name:          "Tumblr",
-			CNAMESuffixes: []string{".tumblr.com"},
+			Status:        models.StatusEdgeCase,
+			CNAMESuffixes: []string{"domains.tumblr.com"},
 			BodySignals: []BodySignal{
-				{Contains: "Whatever you were looking for doesn't live here"},
+				{Contains: "Whatever you were looking for doesn't currently exist at this address"},
 			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
+			TakeoverDoc: xyz,
 		},
 		{
 			Name:          "Ghost",
+			Status:        models.StatusVulnerable,
 			CNAMESuffixes: []string{".ghost.io"},
-			Headers:       []HeaderMatch{{Key: "x-ghost-cache-status"}},
-			BodySignals:   []BodySignal{{Contains: "The thing you were looking for is no longer here"}},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				if !strings.HasSuffix(strings.ToLower(cname), ".ghost.io") {
-					return false, nil
-				}
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Zendesk",
-			CNAMESuffixes: []string{".zendesk.com"},
-			Headers: []HeaderMatch{
-				{Key: "x-zendesk-origin-server"},
-				{Key: "x-zendesk-request-id"},
-			},
 			BodySignals: []BodySignal{
-				{Contains: "Help Center Closed"},
-				{Contains: "Oops, this help center no longer exists"},
+				{Contains: "Site unavailable."},
+				{Contains: "Failed to resolve DNS path for this host"},
 			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Freshdesk",
-			CNAMESuffixes: []string{".freshdesk.com"},
-			BodySignals:   []BodySignal{{Contains: "There is no helpdesk here"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "HubSpot",
-			CNAMESuffixes: []string{".hubspot.com", ".hubspotpagebuilder.com", ".hs-sites.com"},
-			Headers:       []HeaderMatch{{Key: "x-hubspot-request-id"}},
-			BodySignals: []BodySignal{
-				{Contains: "Domain not found"},
-				{Contains: "This domain hasn't been connected"},
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Surge.sh",
-			CNAMESuffixes: []string{".surge.sh"},
-			BodySignals:   []BodySignal{{Contains: "project not found"}},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				if !strings.HasSuffix(strings.ToLower(cname), ".surge.sh") {
-					return false, nil
-				}
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Pantheon",
-			CNAMESuffixes: []string{".pantheonsite.io"},
-			BodySignals:   []BodySignal{{Contains: "The gods are wise, but do not know of the site which you seek"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Read the Docs",
-			CNAMESuffixes: []string{".readthedocs.io", ".readthedocs.org"},
-			BodySignals:   []BodySignal{{Contains: "Unknown Project"}},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Fastly",
-			CNAMESuffixes: []string{".global.prod.fastly.net", ".fastly.net"},
-			Headers: []HeaderMatch{
-				{Key: "x-served-by", Contains: "cache"},
-				{Key: "fastly-restarts"},
-				{Key: "x-fastly-request-id"},
-			},
-			BodySignals: []BodySignal{
-				{Contains: "Fastly error: unknown domain"},
-				{Contains: "Please check that this domain has been added to a service"},
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Bitbucket Pages",
-			CNAMESuffixes: []string{".bitbucket.io"},
-			BodySignals:   []BodySignal{{Contains: "Repository not found"}},
-			ClaimCheck: func(ctx context.Context, cname string) (bool, error) {
-				return dnsNXDomainCheck(ctx, cname)
-			},
-			TakeoverDoc: "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "UserVoice",
-			CNAMESuffixes: []string{".uservoice.com"},
-			BodySignals:   []BodySignal{{Contains: "This UserVoice subdomain is currently available!"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			ClaimCheck:  bodyClaim("Failed to resolve DNS path for this host", "Site unavailable."),
+			TakeoverDoc: xyz,
 		},
 		{
 			Name:          "Intercom",
-			CNAMESuffixes: []string{".intercom.io", ".custom.intercom.io"},
-			Headers:       []HeaderMatch{{Key: "x-intercom-frame-nonce"}},
-			BodySignals:   []BodySignal{{Contains: "This page is reserved for artistic dogs"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			Status:        models.StatusEdgeCase,
+			CNAMESuffixes: []string{"custom.intercom.help", ".intercom.io"},
+			BodySignals: []BodySignal{
+				{Contains: "Uh oh. That page doesn't exist."},
+				{Contains: "This page is reserved for artistic dogs"},
+			},
+			TakeoverDoc: xyz,
 		},
 		{
 			Name:          "WordPress.com",
+			Status:        models.StatusVulnerable,
 			CNAMESuffixes: []string{".wordpress.com"},
-			Headers:       []HeaderMatch{{Key: "x-hacker"}},
 			BodySignals:   []BodySignal{{Contains: "Do you want to register"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Squarespace",
-			CNAMESuffixes: []string{".squarespace.com"},
-			Headers:       []HeaderMatch{{Key: "server", Contains: "Squarespace"}},
-			BodySignals:   []BodySignal{{Contains: "No Such Account"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
-		},
-		{
-			Name:          "Cargo Collective",
-			CNAMESuffixes: []string{".cargocollective.com"},
-			BodySignals:   []BodySignal{{Contains: "If you're moving your domain away from Cargo"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			TakeoverDoc:   xyz,
 		},
 		{
 			Name:          "Agile CRM",
-			CNAMESuffixes: []string{".agilecrm.com"},
-			BodySignals:   []BodySignal{{Contains: "Sorry, this page is no longer available"}},
-			TakeoverDoc:   "https://github.com/EdOverflow/can-i-take-over-xyz",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{"cname.agilecrm.com", ".agilecrm.com"},
+			BodySignals:   []BodySignal{{Contains: "Sorry, this page is no longer available."}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Cargo Collective",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".cargocollective.com"},
+			BodySignals:   []BodySignal{{Contains: "If you're moving your domain away from Cargo"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Campaign Monitor",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".createsend.com"},
+			BodySignals:   []BodySignal{{Contains: "Trying to access your account?"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Canny",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{"cname.canny.io", ".canny.io"},
+			BodySignals: []BodySignal{
+				{Contains: "Company Not Found"},
+				{Contains: "There is no such company. Did you enter the right URL?"},
+			},
+			TakeoverDoc: xyz,
+		},
+		{
+			Name:          "Gemfury",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".furyns.com"},
+			BodySignals:   []BodySignal{{Contains: "404: This page could not be found."}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Help Juice",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".helpjuice.com"},
+			BodySignals:   []BodySignal{{Contains: "We could not find what you're looking for."}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Help Scout",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".helpscoutdocs.com"},
+			BodySignals:   []BodySignal{{Contains: "No settings were found for this company:"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "JetBrains YouTrack",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".myjetbrains.com"},
+			BodySignals:   []BodySignal{{Contains: "is not a registered InCloud YouTrack"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Ngrok",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".ngrok.io", ".ngrok-free.app", ".ngrok.app"},
+			BodySignals: []BodySignal{
+				{Contains: "ngrok.io not found"},
+				{Contains: "ERR_NGROK_3200"},
+			},
+			TakeoverDoc: xyz,
+		},
+		{
+			Name:          "Pingdom",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{"stats.pingdom.com"},
+			BodySignals:   []BodySignal{{Contains: "Sorry, couldn't find the status page"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Readme.io",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".readme.io", "ssl.readmessl.com"},
+			BodySignals: []BodySignal{
+				{Contains: "The creators of this project are still working on making everything perfect!"},
+			},
+			TakeoverDoc: xyz,
+		},
+		{
+			Name:          "SmartJobBoard",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".smartjobboard.com"},
+			BodySignals: []BodySignal{
+				{Contains: "This job board website is either expired or its domain name is invalid."},
+			},
+			TakeoverDoc: xyz,
+		},
+		{
+			Name:          "Strikingly",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{"s.strikinglydns.com", ".strikinglydns.com"},
+			BodySignals:   []BodySignal{{Contains: "PAGE NOT FOUND."}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "SurveySparrow",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".surveysparrow.com"},
+			BodySignals:   []BodySignal{{Contains: "Account not found."}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Uberflip",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{"read.uberflip.com", ".uberflip.com"},
+			BodySignals:   []BodySignal{{Contains: "The URL you've accessed does not provide a hub."}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "UptimeRobot",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{"stats.uptimerobot.com"},
+			BodySignals:   []BodySignal{{Contains: "page not found"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Worksites",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".worksites.net"},
+			BodySignals: []BodySignal{
+				{Contains: "Hello! Sorry, but the website you&rsquo;re looking for doesn&rsquo;t exist."},
+			},
+			TakeoverDoc: xyz,
+		},
+		{
+			Name:          "HatenaBlog",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".hatenablog.com"},
+			BodySignals:   []BodySignal{{Contains: "404 Blog is not found"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Discourse",
+			Status:        models.StatusVulnerable,
+			CNAMESuffixes: []string{".trydiscourse.com"},
+			ClaimCheck:    nxClaim(".trydiscourse.com"),
+			TakeoverDoc:   xyz,
+		},
+
+		// ── Not vulnerable (identified for context only) ──────────────────────
+		{
+			Name:          "Zendesk",
+			Status:        models.StatusNotVulnerable,
+			CNAMESuffixes: []string{".zendesk.com"},
+			Headers:       []HeaderMatch{{Key: "x-zendesk-origin-server"}},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Freshdesk",
+			Status:        models.StatusNotVulnerable,
+			CNAMESuffixes: []string{".freshdesk.com"},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "HubSpot",
+			Status:        models.StatusNotVulnerable,
+			CNAMESuffixes: []string{".hubspot.net", ".hs-sites.com", ".hubspotpagebuilder.com"},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "UserVoice",
+			Status:        models.StatusNotVulnerable,
+			CNAMESuffixes: []string{".uservoice.com"},
+			TakeoverDoc:   xyz,
+		},
+		{
+			Name:          "Squarespace",
+			Status:        models.StatusNotVulnerable,
+			CNAMESuffixes: []string{".squarespace.com"},
+			TakeoverDoc:   xyz,
 		},
 	}
 }

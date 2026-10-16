@@ -4,6 +4,7 @@ package models
 import (
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -33,6 +34,25 @@ func (s Severity) String() string {
 		return "CRITICAL"
 	default:
 		return "UNKNOWN"
+	}
+}
+
+// ParseSeverity parses "info", "low", "medium", "high" or "critical"
+// (case-insensitive).
+func ParseSeverity(s string) (Severity, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "info":
+		return SeverityInfo, nil
+	case "low":
+		return SeverityLow, nil
+	case "medium":
+		return SeverityMedium, nil
+	case "high":
+		return SeverityHigh, nil
+	case "critical":
+		return SeverityCritical, nil
+	default:
+		return SeverityInfo, fmt.Errorf("unknown severity %q (valid: info, low, medium, high, critical)", s)
 	}
 }
 
@@ -72,8 +92,9 @@ type DNSChain struct {
 	Root          string   // The original target domain
 	Hops          []DNSHop // All hops in order
 	DanglingPoint int      // Index of the hop where resolution breaks (-1 if none)
-	IsWildcard    bool     // Whether the root domain has a wildcard record
+	IsWildcard    bool     // Whether the name is answered by a parent wildcard record
 	HasLoop       bool     // Whether a CNAME loop was detected
+	NotExist      bool     // The queried name itself is NXDOMAIN (no record exists)
 }
 
 // IsDangling returns true if the chain has an identified dangling point.
@@ -90,9 +111,25 @@ func (c *DNSChain) DanglingHop() *DNSHop {
 	return &h
 }
 
+// CNAMETargets returns every CNAME target in the chain, in order.
+func (c *DNSChain) CNAMETargets() []string {
+	var out []string
+	for _, h := range c.Hops {
+		if h.RecordType == RecordCNAME && h.Value != "" {
+			out = append(out, h.Value)
+		}
+	}
+	return out
+}
+
 // FinalCNAME returns the last CNAME value in the chain before the dangling point.
+// For a healthy chain it returns the last CNAME target in the chain.
 func (c *DNSChain) FinalCNAME() string {
-	for i := c.DanglingPoint - 1; i >= 0; i-- {
+	end := c.DanglingPoint
+	if end < 0 {
+		end = len(c.Hops)
+	}
+	for i := end - 1; i >= 0; i-- {
 		if c.Hops[i].RecordType == RecordCNAME {
 			return c.Hops[i].Value
 		}
@@ -163,7 +200,18 @@ const (
 	SignalHeader        SignalType = "header"
 	SignalBodyMarker    SignalType = "body_marker"
 	SignalStatusCode    SignalType = "status_code"
+	SignalDNSNXDomain   SignalType = "dns_nxdomain"
 	SignalClaimVerified SignalType = "claim_verified"
+)
+
+// ProviderStatus describes whether a provider is known to allow takeovers,
+// following the can-i-take-over-xyz classification.
+type ProviderStatus string
+
+const (
+	StatusVulnerable    ProviderStatus = "vulnerable"
+	StatusEdgeCase      ProviderStatus = "edge_case"
+	StatusNotVulnerable ProviderStatus = "not_vulnerable"
 )
 
 // Signal represents a single piece of evidence contributing to a provider match.
@@ -181,11 +229,24 @@ type ProviderMatch struct {
 	ClaimVerified   bool     // Whether the resource was confirmed claimable
 	TakeoverWriteup string   // URL to a public writeup/PoC
 	ClaimURL        string   // 1-click platform URL to claim the resource
+	Status          ProviderStatus
 }
 
 // IsIdentified returns true if a provider was matched with sufficient confidence.
 func (m *ProviderMatch) IsIdentified() bool {
 	return m.ProviderName != "" && m.Confidence >= 60
+}
+
+// HasEvidence returns true if the match contains a signal that shows the
+// resource is unclaimed (an unclaimed-resource body marker or an NXDOMAIN
+// CNAME target), as opposed to signals that only identify the provider.
+func (m *ProviderMatch) HasEvidence() bool {
+	for _, s := range m.Signals {
+		if s.Type == SignalBodyMarker || s.Type == SignalDNSNXDomain {
+			return true
+		}
+	}
+	return false
 }
 
 // TXTRecord holds analysed data from a DNS TXT record.
@@ -246,6 +307,9 @@ type ScanResult struct {
 	Findings  []*Finding
 	Errors    []ScanError
 	Stats     ScanStats
+	// Interrupted is true when the scan was cancelled before every domain
+	// was processed.
+	Interrupted bool
 }
 
 // ScanStats holds counters for a scan run.

@@ -9,21 +9,26 @@ package resolver
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"math/rand"
+	mrand "math/rand"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/MrEx-Right/SubReaper/internal/models"
+	"github.com/MrEx-Right/SubReaper/internal/ratelimit"
 	"github.com/miekg/dns"
 )
 
-const (
-	maxCNAMEDepth = 20   // maximum CNAME chain length before aborting (loop guard)
-	bodyReadLimit = 4096 // max bytes read from DNS response
-)
+const maxCNAMEDepth = 20 // maximum CNAME chain length before aborting (loop guard)
+
+// ErrNXDOMAIN is returned by lookups whose queried name does not exist.
+var ErrNXDOMAIN = errors.New("NXDOMAIN")
 
 // Resolver performs DNS queries using a pool of upstream resolvers.
 type Resolver struct {
@@ -32,23 +37,64 @@ type Resolver struct {
 	retries int           // retry count per query
 	counter atomic.Uint64 // round-robin index
 	client  *dns.Client
+	tcp     *dns.Client
+	limiter *ratelimit.Limiter
 }
 
 // New creates a Resolver with the given upstream servers.
-// servers must be in "host:port" format (e.g. "8.8.8.8:53").
+// Servers may be given as "host:port" or as a bare IP/host, in which case
+// port 53 is assumed. Entries that cannot be parsed are dropped.
 func New(servers []string, timeout time.Duration, retries int) *Resolver {
-	if len(servers) == 0 {
-		servers = []string{"8.8.8.8:53", "1.1.1.1:53"}
+	normalized, _ := NormalizeServers(servers)
+	if len(normalized) == 0 {
+		normalized = []string{"8.8.8.8:53", "1.1.1.1:53"}
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if retries < 0 {
+		retries = 0
 	}
 	return &Resolver{
-		servers: servers,
+		servers: normalized,
 		timeout: timeout,
 		retries: retries,
-		client: &dns.Client{
-			Net:     "udp",
-			Timeout: timeout,
-		},
+		client:  &dns.Client{Net: "udp", Timeout: timeout},
+		tcp:     &dns.Client{Net: "tcp", Timeout: timeout},
 	}
+}
+
+// SetLimiter makes every query wait on l before it is sent.
+func (r *Resolver) SetLimiter(l *ratelimit.Limiter) { r.limiter = l }
+
+// Servers returns the upstream servers in use.
+func (r *Resolver) Servers() []string { return r.servers }
+
+// NormalizeServers converts resolver entries to "host:port" form, adding
+// port 53 where it is missing. It returns the valid entries and an error
+// listing the entries it could not use.
+func NormalizeServers(servers []string) ([]string, error) {
+	var out, bad []string
+	for _, s := range servers {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if host, port, err := net.SplitHostPort(s); err == nil && host != "" && port != "" {
+			out = append(out, net.JoinHostPort(host, port))
+			continue
+		}
+		host := strings.Trim(s, "[]")
+		if host == "" || strings.ContainsAny(host, " \t/") {
+			bad = append(bad, s)
+			continue
+		}
+		out = append(out, net.JoinHostPort(host, "53"))
+	}
+	if len(bad) > 0 {
+		return out, fmt.Errorf("invalid resolver entries: %s", strings.Join(bad, ", "))
+	}
+	return out, nil
 }
 
 // nextServer returns the next upstream server using round-robin selection.
@@ -57,8 +103,31 @@ func (r *Resolver) nextServer() string {
 	return r.servers[idx%uint64(len(r.servers))]
 }
 
+// exchange sends msg to server and returns as soon as either the response
+// arrives or ctx is cancelled. miekg/dns only honours context deadlines, not
+// cancellation, so the exchange runs in its own goroutine.
+func (r *Resolver) exchange(ctx context.Context, c *dns.Client, msg *dns.Msg, server string) (*dns.Msg, error) {
+	type result struct {
+		resp *dns.Msg
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		resp, _, err := c.Exchange(msg.Copy(), server)
+		ch <- result{resp, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.resp, res.err
+	}
+}
+
 // query sends a DNS query and returns the response, retrying on failure.
-// It automatically falls back to TCP if the UDP response is truncated.
+// It falls back to TCP if the UDP response is truncated. SERVFAIL and REFUSED
+// answers are retried on the next server and reported as errors, since they
+// say nothing about whether the name exists.
 func (r *Resolver) query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(name), qtype)
@@ -66,44 +135,48 @@ func (r *Resolver) query(ctx context.Context, name string, qtype uint16) (*dns.M
 
 	var lastErr error
 	for attempt := 0; attempt <= r.retries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if err := r.limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+		if attempt > 0 {
+			jitter := time.Duration(mrand.Intn(100)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(jitter):
+			}
 		}
 
 		server := r.nextServer()
-		resp, _, err := r.client.ExchangeContext(ctx, msg, server)
+		resp, err := r.exchange(ctx, r.client, msg, server)
+		if err == nil && resp.Truncated {
+			resp, err = r.exchange(ctx, r.tcp, msg, server)
+		}
 		if err != nil {
-			lastErr = err
-			// Jitter before retry
-			if attempt < r.retries {
-				jitter := time.Duration(rand.Intn(100)) * time.Millisecond
-				time.Sleep(jitter)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
+			lastErr = err
 			continue
 		}
-
-		// If truncated, retry over TCP
-		if resp.Truncated {
-			tcpClient := &dns.Client{Net: "tcp", Timeout: r.timeout}
-			resp, _, err = tcpClient.ExchangeContext(ctx, msg, server)
-			if err != nil {
-				lastErr = err
-				continue
-			}
+		if resp.Rcode == dns.RcodeServerFailure || resp.Rcode == dns.RcodeRefused {
+			lastErr = fmt.Errorf("%s from %s", dns.RcodeToString[resp.Rcode], server)
+			continue
 		}
-
 		return resp, nil
 	}
 
-	return nil, fmt.Errorf("all %d attempts failed for %s (type %d): %w",
-		r.retries+1, name, qtype, lastErr)
+	return nil, fmt.Errorf("all %d attempts failed for %s (%s): %w",
+		r.retries+1, name, dns.TypeToString[qtype], lastErr)
 }
 
 // TraverseChain resolves the full DNS chain for the given domain.
 // It follows CNAME records until it reaches an A/AAAA record or a dead end.
-// Loop detection is performed via a visited set.
+//
+// A chain is only dangling when a CNAME points at a name that returns
+// NXDOMAIN. If the queried name itself does not exist the chain is marked
+// NotExist instead. Resolution errors (timeouts, SERVFAIL) are returned as
+// errors and never treated as dangling.
 func (r *Resolver) TraverseChain(ctx context.Context, domain string) (*models.DNSChain, error) {
 	chain := &models.DNSChain{
 		Root:          domain,
@@ -114,96 +187,82 @@ func (r *Resolver) TraverseChain(ctx context.Context, domain string) (*models.DN
 	current := domain
 
 	for depth := 0; depth < maxCNAMEDepth; depth++ {
-		select {
-		case <-ctx.Done():
-			return chain, ctx.Err()
-		default:
-		}
-
-		fqdn := dns.Fqdn(current)
+		fqdn := strings.ToLower(dns.Fqdn(current))
 		if _, seen := visited[fqdn]; seen {
 			chain.HasLoop = true
 			return chain, nil
 		}
 		visited[fqdn] = struct{}{}
 
-		// Query for CNAME first
 		resp, err := r.query(ctx, current, dns.TypeCNAME)
 		if err != nil {
-			hop := models.DNSHop{
-				Name:       current,
-				RecordType: models.RecordCNAME,
-				Value:      "",
-				Resolved:   false,
-			}
-			chain.Hops = append(chain.Hops, hop)
-			chain.DanglingPoint = len(chain.Hops) - 1
-			return chain, nil
+			return chain, fmt.Errorf("resolve %s: %w", current, err)
 		}
 
-		if resp.Rcode == dns.RcodeNameError { // NXDOMAIN
-			hop := models.DNSHop{
+		if resp.Rcode == dns.RcodeNameError {
+			if depth == 0 {
+				chain.NotExist = true
+				return chain, nil
+			}
+			chain.Hops = append(chain.Hops, models.DNSHop{
 				Name:       current,
 				RecordType: models.RecordCNAME,
-				Value:      "",
-				Resolved:   false,
 				NXDOMAIN:   true,
-			}
-			chain.Hops = append(chain.Hops, hop)
+			})
 			chain.DanglingPoint = len(chain.Hops) - 1
 			return chain, nil
 		}
 
-		// Check for CNAME records in the answer
+		// Use the CNAME owned by the name we asked about; some resolvers
+		// return the whole chain in the answer section.
 		cnameTarget := ""
 		for _, rr := range resp.Answer {
-			if cname, ok := rr.(*dns.CNAME); ok {
-				cnameTarget = strings.TrimSuffix(cname.Target, ".")
+			if cname, ok := rr.(*dns.CNAME); ok && strings.EqualFold(cname.Hdr.Name, fqdn) {
+				cnameTarget = strings.ToLower(strings.TrimSuffix(cname.Target, "."))
 				break
 			}
 		}
 
 		if cnameTarget != "" {
-			hop := models.DNSHop{
+			chain.Hops = append(chain.Hops, models.DNSHop{
 				Name:       current,
 				RecordType: models.RecordCNAME,
 				Value:      cnameTarget,
 				Resolved:   true,
-			}
-			chain.Hops = append(chain.Hops, hop)
+			})
 			current = cnameTarget
 			continue
 		}
 
-		// No CNAME — try A record
+		// No CNAME — resolve address records
 		aResp, err := r.query(ctx, current, dns.TypeA)
-		if err != nil || aResp.Rcode == dns.RcodeNameError {
-			hop := models.DNSHop{
+		if err != nil {
+			return chain, fmt.Errorf("resolve %s: %w", current, err)
+		}
+		if aResp.Rcode == dns.RcodeNameError {
+			if depth == 0 {
+				chain.NotExist = true
+				return chain, nil
+			}
+			chain.Hops = append(chain.Hops, models.DNSHop{
 				Name:       current,
 				RecordType: models.RecordA,
-				Value:      "",
-				Resolved:   false,
-				NXDOMAIN:   aResp != nil && aResp.Rcode == dns.RcodeNameError,
-			}
-			chain.Hops = append(chain.Hops, hop)
+				NXDOMAIN:   true,
+			})
 			chain.DanglingPoint = len(chain.Hops) - 1
 			return chain, nil
 		}
 
-		// Collect A records
 		for _, rr := range aResp.Answer {
 			if a, ok := rr.(*dns.A); ok {
-				hop := models.DNSHop{
+				chain.Hops = append(chain.Hops, models.DNSHop{
 					Name:       current,
 					RecordType: models.RecordA,
 					Value:      a.A.String(),
 					Resolved:   true,
-				}
-				chain.Hops = append(chain.Hops, hop)
+				})
 			}
 		}
-
-		// Successfully resolved to IPs — no dangling point
 		return chain, nil
 	}
 
@@ -212,22 +271,66 @@ func (r *Resolver) TraverseChain(ctx context.Context, domain string) (*models.DN
 	return chain, nil
 }
 
-// CheckWildcard determines whether the domain has a wildcard DNS record.
-// It generates a random subdomain and checks if it resolves.
-// If it does, *.domain is a wildcard and bruteforce results will be unreliable.
-func (r *Resolver) CheckWildcard(ctx context.Context, domain string) (bool, error) {
-	// Use a fixed random-looking subdomain — deterministic for reproducibility
-	probe := fmt.Sprintf("subreaper-wildcard-check-7f3a9c.%s", domain)
-	resp, err := r.query(ctx, probe, dns.TypeA)
+// WildcardSignature probes a random label directly under parent and returns
+// a signature of what the wildcard answers with (see ChainSignature), or ""
+// when parent has no wildcard record.
+func (r *Resolver) WildcardSignature(ctx context.Context, parent string) (string, error) {
+	buf := make([]byte, 6)
+	_, _ = rand.Read(buf)
+	probe := "subreaper-wc-" + hex.EncodeToString(buf) + "." + parent
+	chain, err := r.TraverseChain(ctx, probe)
 	if err != nil {
-		// Query failure is not a wildcard
-		return false, nil
+		return "", err
 	}
-	if resp.Rcode == dns.RcodeNameError {
-		return false, nil
+	if chain.NotExist {
+		return "", nil
 	}
-	// Any non-NXDOMAIN response suggests a wildcard
-	return len(resp.Answer) > 0, nil
+	return ChainSignature(chain), nil
+}
+
+// ChainSignature summarises the first answer of a chain: its first CNAME
+// target, or the sorted set of A records. Two names answered by the same
+// wildcard record have the same signature.
+func ChainSignature(chain *models.DNSChain) string {
+	if chain == nil || len(chain.Hops) == 0 {
+		return ""
+	}
+	if chain.Hops[0].RecordType == models.RecordCNAME {
+		return "cname:" + chain.Hops[0].Value
+	}
+	var ips []string
+	for _, h := range chain.Hops {
+		if h.RecordType == models.RecordA && h.Value != "" {
+			ips = append(ips, h.Value)
+		}
+	}
+	sort.Strings(ips)
+	return "a:" + strings.Join(ips, ",")
+}
+
+// hostExists reports whether host has any address record. NXDOMAIN is
+// reported as (false, true, nil); a host that exists returns (true, false, nil).
+func (r *Resolver) hostExists(ctx context.Context, host string) (resolved, nxdomain bool, err error) {
+	for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		resp, err := r.query(ctx, host, qt)
+		if err != nil {
+			return false, false, err
+		}
+		if resp.Rcode == dns.RcodeNameError {
+			return false, true, nil
+		}
+		if len(resp.Answer) > 0 {
+			return true, false, nil
+		}
+	}
+	return false, false, nil
+}
+
+// IsNXDOMAIN reports whether host returns NXDOMAIN. Resolution errors are
+// returned as errors, never as NXDOMAIN.
+func (r *Resolver) IsNXDOMAIN(ctx context.Context, host string) (bool, error) {
+	_, nx, err := r.hostExists(ctx, host)
+	return nx, err
 }
 
 // ResolveNS returns the nameservers for the given domain and checks if they resolve.
@@ -240,16 +343,17 @@ func (r *Resolver) ResolveNS(ctx context.Context, domain string) ([]models.DNSHo
 	var hops []models.DNSHop
 	for _, rr := range resp.Answer {
 		ns, ok := rr.(*dns.NS)
-		if !ok {
+		if !ok || !strings.EqualFold(ns.Hdr.Name, dns.Fqdn(domain)) {
 			continue
 		}
 		nsHost := strings.TrimSuffix(ns.Ns, ".")
-
-		// Check if the nameserver itself resolves
-		aResp, err := r.query(ctx, nsHost, dns.TypeA)
-		resolved := err == nil && aResp.Rcode != dns.RcodeNameError && len(aResp.Answer) > 0
-		nxdomain := err == nil && aResp.Rcode == dns.RcodeNameError
-
+		if nsHost == "" {
+			continue
+		}
+		resolved, nxdomain, err := r.hostExists(ctx, nsHost)
+		if err != nil {
+			continue // unknown state is not evidence of anything
+		}
 		hops = append(hops, models.DNSHop{
 			Name:       domain,
 			RecordType: models.RecordNS,
@@ -262,6 +366,7 @@ func (r *Resolver) ResolveNS(ctx context.Context, domain string) ([]models.DNSHo
 }
 
 // ResolveMX returns the mail exchangers for the given domain and checks if they resolve.
+// A null MX record ("MX 0 .", RFC 7505) means the domain accepts no mail and is skipped.
 func (r *Resolver) ResolveMX(ctx context.Context, domain string) ([]models.DNSHop, error) {
 	resp, err := r.query(ctx, domain, dns.TypeMX)
 	if err != nil {
@@ -275,11 +380,13 @@ func (r *Resolver) ResolveMX(ctx context.Context, domain string) ([]models.DNSHo
 			continue
 		}
 		mxHost := strings.TrimSuffix(mx.Mx, ".")
-
-		aResp, err := r.query(ctx, mxHost, dns.TypeA)
-		resolved := err == nil && aResp.Rcode != dns.RcodeNameError && len(aResp.Answer) > 0
-		nxdomain := err == nil && aResp.Rcode == dns.RcodeNameError
-
+		if mxHost == "" {
+			continue // null MX
+		}
+		resolved, nxdomain, err := r.hostExists(ctx, mxHost)
+		if err != nil {
+			continue
+		}
 		hops = append(hops, models.DNSHop{
 			Name:       domain,
 			RecordType: models.RecordMX,
@@ -319,10 +426,14 @@ func (r *Resolver) ResolveIPs(ctx context.Context, domain string) ([]net.IP, err
 // ResolveTXT returns all TXT record values for the given domain.
 // It also checks _dmarc.<domain> and returns those values with a "dmarc:" prefix
 // so callers can distinguish DMARC records from plain TXT records.
+// It returns ErrNXDOMAIN when the domain does not exist.
 func (r *Resolver) ResolveTXT(ctx context.Context, domain string) ([]string, error) {
 	resp, err := r.query(ctx, domain, dns.TypeTXT)
 	if err != nil {
 		return nil, err
+	}
+	if resp.Rcode == dns.RcodeNameError {
+		return nil, ErrNXDOMAIN
 	}
 
 	var records []string
@@ -333,9 +444,11 @@ func (r *Resolver) ResolveTXT(ctx context.Context, domain string) ([]string, err
 	}
 
 	// Also query _dmarc.<domain>
-	dmarcDomain := "_dmarc." + domain
-	dmarcResp, err := r.query(ctx, dmarcDomain, dns.TypeTXT)
-	if err == nil && dmarcResp.Rcode != dns.RcodeNameError {
+	dmarcResp, err := r.query(ctx, "_dmarc."+domain, dns.TypeTXT)
+	if err != nil {
+		return nil, err
+	}
+	if dmarcResp.Rcode != dns.RcodeNameError {
 		for _, rr := range dmarcResp.Answer {
 			if txt, ok := rr.(*dns.TXT); ok {
 				records = append(records, "dmarc:"+strings.Join(txt.Txt, ""))

@@ -1,7 +1,7 @@
 BINARY    := subreaper
-VERSION   := 1.0.0
+VERSION   := 2.0.0
 BUILD_DIR := build
-LDFLAGS   := -ldflags="-s -w -X main.version=$(VERSION)"
+LDFLAGS   := -ldflags="-s -w -X github.com/MrEx-Right/SubReaper/cmd.version=$(VERSION)"
 
 .PHONY: all build clean test vet fmt install help
 

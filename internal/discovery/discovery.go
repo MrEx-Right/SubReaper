@@ -7,13 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
-
-	"golang.org/x/net/publicsuffix"
 )
 
 // CrtShEntry represents a single entry returned by the crt.sh JSON API.
@@ -31,27 +30,21 @@ type CrtShEntry struct {
 func QueryCrtSh(ctx context.Context, domain string) ([]string, error) {
 	apiURL := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", url.QueryEscape(domain))
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("crt.sh request build: %w", err)
-	}
-	req.Header.Set("User-Agent", "SubReaper/1.0")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("crt.sh query: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("crt.sh returned HTTP %d", resp.StatusCode)
-	}
-
+	// crt.sh frequently answers 502/503 under load; one retry fixes most of them.
 	var entries []CrtShEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		return nil, fmt.Errorf("crt.sh response decode: %w", err)
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		entries, err = fetchCrtSh(ctx, apiURL)
+		if err == nil || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(3 * time.Second):
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	seen := make(map[string]struct{})
@@ -85,6 +78,32 @@ func QueryCrtSh(ctx context.Context, domain string) ([]string, error) {
 	return subdomains, nil
 }
 
+func fetchCrtSh(ctx context.Context, apiURL string) ([]CrtShEntry, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("crt.sh request build: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("crt.sh query: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("crt.sh returned HTTP %d", resp.StatusCode)
+	}
+
+	var entries []CrtShEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		return nil, fmt.Errorf("crt.sh response decode: %w", err)
+	}
+	return entries, nil
+}
+
 // LoadWordlist reads a wordlist file and returns a list of candidate subdomains
 // for the given domain. Each line of the file is treated as a subdomain prefix.
 func LoadWordlist(path string, domain string) ([]string, error) {
@@ -93,11 +112,15 @@ func LoadWordlist(path string, domain string) ([]string, error) {
 		return nil, fmt.Errorf("open wordlist: %w", err)
 	}
 	defer f.Close()
+	return ParseWordlist(f, domain)
+}
 
+// ParseWordlist reads wordlist lines from r and returns candidate subdomains.
+func ParseWordlist(r io.Reader, domain string) ([]string, error) {
 	seen := make(map[string]struct{})
 	var subdomains []string
 
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(strings.ToLower(scanner.Text()))
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -132,9 +155,9 @@ func GeneratePermutations(subdomains []string, domain string) []string {
 	var permutations []string
 
 	for _, sub := range subdomains {
-		// Extract the subdomain label (part before the first dot that's also in the domain)
-		etld1, err := publicsuffix.EffectiveTLDPlusOne(sub)
-		if err != nil || etld1 != domain {
+		// Only names under the target; works for registrable domains and
+		// for deeper targets such as dev.example.com alike.
+		if !strings.HasSuffix(sub, "."+domain) {
 			continue
 		}
 		label := strings.TrimSuffix(sub, "."+domain)

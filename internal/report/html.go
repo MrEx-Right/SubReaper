@@ -118,6 +118,17 @@ func (r *HTMLReporter) Write(w io.Writer, result *models.ScanResult) error {
 		fmt.Fprintln(w, `</tbody></table>`)
 	}
 
+	if result.Interrupted {
+		fmt.Fprintln(w, `<p class="note">Scan interrupted: results are partial.</p>`)
+	}
+	if len(result.Errors) > 0 {
+		fmt.Fprintf(w, "<h2>Scan Errors (%d)</h2>\n<ul class=\"errors\">\n", len(result.Errors))
+		for _, e := range result.Errors {
+			fmt.Fprintf(w, "<li><code>%s</code>: %s</li>\n", html.EscapeString(e.Domain), html.EscapeString(e.Message))
+		}
+		fmt.Fprintln(w, "</ul>")
+	}
+
 	fmt.Fprint(w, htmlFooter)
 	return nil
 }
@@ -146,6 +157,23 @@ func buildHTMLDetail(f *models.Finding) string {
 			))
 		}
 		sb.WriteString("</pre>")
+	}
+
+	if len(f.IPs) > 0 {
+		sb.WriteString(fmt.Sprintf("<p><strong>IPs:</strong> %s</p>", html.EscapeString(joinIPs(f))))
+	}
+	if s := probeSummary(f); s != "" {
+		sb.WriteString(fmt.Sprintf("<p><strong>HTTP:</strong> %s</p>", html.EscapeString(s)))
+	}
+	if len(f.Technologies) > 0 {
+		sb.WriteString(fmt.Sprintf("<p><strong>Technologies:</strong> %s</p>", html.EscapeString(strings.Join(f.Technologies, ", "))))
+	}
+	if len(f.TXTRecords) > 0 {
+		sb.WriteString("<p><strong>TXT records:</strong></p><ul>")
+		for _, t := range f.TXTRecords {
+			sb.WriteString(fmt.Sprintf("<li><code>%s</code>: %s</li>", html.EscapeString(t.Kind), html.EscapeString(t.Raw)))
+		}
+		sb.WriteString("</ul>")
 	}
 
 	if f.Provider != nil && len(f.Provider.Signals) > 0 {
@@ -237,6 +265,10 @@ const htmlHeader = `<!DOCTYPE html>
   .detail li { margin: 0.25rem 0; font-size: 0.85rem; }
   .detail a { color: var(--low); }
   .no-findings { color: var(--green); font-size: 1.1rem; margin-top: 2rem; }
+  h2 { font-size: 1.1rem; margin: 2rem 0 0.75rem; color: var(--dim); }
+  .errors { margin-left: 1.5rem; color: var(--dim); font-size: 0.85rem; }
+  .errors li { margin: 0.2rem 0; }
+  .note { color: var(--medium); margin-top: 1.5rem; }
 </style>
 </head>
 <body>

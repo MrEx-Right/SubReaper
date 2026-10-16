@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"strings"
 
 	"github.com/MrEx-Right/SubReaper/internal/models"
 	"github.com/MrEx-Right/SubReaper/internal/providers"
@@ -21,31 +20,28 @@ func stageVerify(
 	chain *models.DNSChain,
 	match *models.ProviderMatch,
 	registry *providers.Registry,
+	env *providers.CheckEnv,
 ) (bool, error) {
 	if match == nil || !match.IsIdentified() {
 		return false, nil
 	}
 
-	// Find the provider in the registry
-	var provider *providers.Provider
-	for _, p := range registry.All() {
-		if strings.EqualFold(p.Name, match.ProviderName) {
-			provider = p
-			break
-		}
-	}
+	provider := registry.Get(match.ProviderName)
 
 	if provider == nil || provider.ClaimCheck == nil {
 		// No claim check available for this provider
 		return false, nil
 	}
 
-	// Determine the CNAME to check
+	// Check the CNAME target that belongs to the provider
 	cname := ""
 	if chain != nil {
-		cname = chain.FinalCNAME()
-		if cname == "" && chain.DanglingHop() != nil {
-			cname = chain.DanglingHop().Value
+		targets := chain.CNAMETargets()
+		for i := len(targets) - 1; i >= 0; i-- {
+			if provider.MatchCNAME(targets[i]) != "" {
+				cname = targets[i]
+				break
+			}
 		}
 	}
 	if cname == "" {
@@ -53,7 +49,7 @@ func stageVerify(
 	}
 
 	// Run the provider-specific claim check
-	claimable, err := provider.ClaimCheck(ctx, cname)
+	claimable, err := provider.ClaimCheck(ctx, env, cname)
 	if err != nil {
 		return false, err
 	}

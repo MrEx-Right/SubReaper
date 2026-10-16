@@ -5,13 +5,15 @@ import (
 	"crypto/tls"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/MrEx-Right/SubReaper/internal/config"
 	"github.com/MrEx-Right/SubReaper/internal/models"
+	"github.com/MrEx-Right/SubReaper/internal/ratelimit"
 )
 
-const maxBodyBytes = 4096 // max bytes to read from response body
+const maxBodyBytes = 32 * 1024 // max bytes to read from response body
 
 // stageHTTP performs Stage 2 of the pipeline: HTTP/HTTPS probing.
 //
@@ -21,33 +23,35 @@ const maxBodyBytes = 4096 // max bytes to read from response body
 //
 // This stage intentionally does NOT interpret the results — it only collects
 // evidence for Stage 3 (fingerprinting).
-func stageHTTP(ctx context.Context, domain string, chain *models.DNSChain, cfg *config.Config) ([]*models.HTTPProbe, error) {
+func stageHTTP(ctx context.Context, domain string, chain *models.DNSChain, cfg *config.Config, limiter *ratelimit.Limiter) []*models.HTTPProbe {
 	targets := []string{
 		"https://" + domain,
 		"http://" + domain,
 	}
 
-	// If there's a dangling CNAME, also probe the final CNAME endpoint directly
+	// Also probe the final CNAME endpoint directly
 	if chain != nil {
 		if cname := chain.FinalCNAME(); cname != "" && cname != domain {
 			targets = append(targets, "https://"+cname, "http://"+cname)
 		}
 	}
 
-	var probes []*models.HTTPProbe
-	seen := make(map[string]bool)
-
-	for _, target := range targets {
-		if seen[target] {
-			continue
-		}
-		seen[target] = true
-
-		probe := probeURL(ctx, target, cfg.Timeout)
-		probes = append(probes, probe)
+	// Probes run concurrently so that dead hosts cost one timeout, not four.
+	probes := make([]*models.HTTPProbe, len(targets))
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		wg.Add(1)
+		go func(i int, target string) {
+			defer wg.Done()
+			if err := limiter.Wait(ctx); err != nil {
+				probes[i] = &models.HTTPProbe{URL: target, Error: err.Error()}
+				return
+			}
+			probes[i] = probeURL(ctx, target, cfg.Timeout)
+		}(i, target)
 	}
-
-	return probes, nil
+	wg.Wait()
+	return probes
 }
 
 // probeURL performs a single HTTP probe against the given URL.
@@ -87,7 +91,7 @@ func probeURL(ctx context.Context, rawURL string, timeout time.Duration) *models
 		probe.Error = err.Error()
 		return probe
 	}
-	req.Header.Set("User-Agent", "SubReaper/1.0 (security-scanner)")
+	req.Header.Set("User-Agent", "SubReaper/2.0 (+https://github.com/MrEx-Right/SubReaper)")
 
 	resp, err := client.Do(req)
 	if err != nil {
