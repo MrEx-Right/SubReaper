@@ -4,50 +4,54 @@
   <br>
 </h1>
 
-<h4 align="center">A professional-grade Go CLI tool for detecting dangling subdomains and subdomain takeover vulnerabilities.</h4>
+<h4 align="center">A Go CLI tool for detecting dangling subdomains and subdomain takeover vulnerabilities.</h4>
 
 <p align="center">
-  <a href="https://golang.org/doc/install"><img src="https://img.shields.io/badge/Made%20with-Go-1f425f.svg" alt="Made with Go"></a>
-  <a href="https://github.com/MrEx-Right/SubReaper/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL 3.0"></a>
+  <a href="https://github.com/MrEx-Right/SubReaper/releases"><img src="https://img.shields.io/badge/version-2.0.0-red.svg" alt="Version 2.0.0"></a>
+  <a href="https://go.dev/doc/install"><img src="https://img.shields.io/badge/Go-1.25%2B-00ADD8.svg" alt="Go 1.25+"></a>
+  <a href="https://github.com/MrEx-Right/SubReaper/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   <a href="https://github.com/MrEx-Right/SubReaper/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
 </p>
 
 <p align="center">
-  <a href="#what-it-does">What It Does</a> •
-  <a href="#key-features">Features</a> •
-  <a href="#how-it-works">How It Works</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#usage">Usage</a> •
-  <a href="#severity-model">Severity Model</a>
+  <a href="#-what-it-does">What It Does</a> •
+  <a href="#-key-features">Features</a> •
+  <a href="#-how-it-works">How It Works</a> •
+  <a href="#-installation">Installation</a> •
+  <a href="#-usage">Usage</a> •
+  <a href="#-severity-model">Severity Model</a> •
+  <a href="#-license">License</a>
 </p>
 
 ---
 
 ## 🎯 What It Does
 
-**SubReaper** identifies subdomains that point to cloud services no longer under the control of the target organization — a condition known as a *dangling DNS record* or *subdomain takeover*. An attacker who claims the unclaimed resource can then serve content on the victim's subdomain, intercept cookies, bypass CSP, or phish users.
+**SubReaper** finds subdomains that point to cloud services no longer under the control of the target organization, a condition known as a *dangling DNS record* or *subdomain takeover*. An attacker who claims the abandoned resource can serve content on the victim's subdomain, steal cookies, bypass CSP or phish users.
 
 ## ✨ Key Features
 
-- **Blazing Fast:** Written in Go with high concurrency and optimized DNS resolution.
-- **Low False Positives:** Uses a multi-stage verification pipeline to ensure accurate findings.
-- **Active Verification:** Actually verifies if a cloud resource can be claimed, instead of relying purely on regex patterns.
-- **Rich Output:** Supports beautiful colored terminal output, JSON, Markdown, and HTML reports.
-- **Built-in OSINT:** Built-in crt.sh scraping and wordlist generation for active subdomain discovery.
-- **Broad Coverage:** Supports fingerprinting for over 30+ major cloud providers.
+- **Evidence-based findings:** a takeover is only reported when the CNAME points at a known provider *and* there is proof the resource is unclaimed (an NXDOMAIN target or the provider's unclaimed-resource page).
+- **Catches resolving takeovers:** GitHub Pages, S3, Heroku, Shopify and similar cases are probed even when the provider's DNS still resolves.
+- **Active verification:** provider-specific claim checks (DNS, HTTP, API) confirm whether a resource can really be claimed.
+- **Low noise:** names that don't exist, resolver failures, null MX records and wildcard duplicates are never reported as findings.
+- **45+ providers:** each tagged *vulnerable*, *edge case* or *not vulnerable* following [can-i-take-over-xyz](https://github.com/EdOverflow/can-i-take-over-xyz).
+- **Built-in discovery:** crt.sh, 7 more passive OSINT sources queried in parallel, an embedded wordlist and permutations.
+- **Rich output:** colored terminal output, JSON, Markdown and HTML reports.
+- **Fast and polite:** concurrent workers with a request-level rate limit shared by DNS and HTTP, and Ctrl+C returns partial results right away.
 
-## ⚙️ How It Works
+## 🔧 How It Works
 
-Unlike legacy tools that simply pattern-match HTTP response bodies, SubReaper runs a **four-stage verification pipeline** per target:
+SubReaper runs a **four-stage verification pipeline** per target:
 
 1. 🔍 **DNS Chain Traversal** → Full CNAME/NS/MX chain analysis with loop and wildcard detection.
-2. 🌐 **HTTP Probing** → Status codes, headers, redirect chains, TLS cert info.
+2. 🌐 **HTTP Probing** → Status codes, headers, redirect chains, TLS certificate info.
 3. 🔬 **Provider Fingerprinting** → Multi-signal confidence scoring (not regex-first).
-4. 💣 **Claim Verification** → Provider-specific active check (API, DNS, HTTP) to confirm vulnerability.
+4. 💣 **Claim Verification** → Provider-specific active check to confirm the resource is unclaimed.
 
-A domain enters stages 2–4 when a CNAME target returns NXDOMAIN, **or** when any CNAME in its chain points at a known provider. The second case catches takeovers where the provider's DNS still resolves and only the HTTP response shows the resource is unclaimed (GitHub Pages, S3, Heroku, Shopify, ...).
+A domain enters stages 2–4 when a CNAME target returns NXDOMAIN, **or** when any CNAME in its chain points at a known provider. The second case catches takeovers where the provider's DNS still resolves and only the HTTP response shows the resource is unclaimed.
 
-A takeover candidate needs a provider CNAME **plus** evidence that the resource is unclaimed: an NXDOMAIN target or the provider's unclaimed-resource page. Body pattern matching is never a standalone confirmation, and provider headers alone only identify a working deployment.
+Body pattern matching is never a standalone confirmation, and provider headers alone only identify a working deployment.
 
 What is *not* reported:
 - Names that do not exist at all (NXDOMAIN on the queried name itself).
@@ -57,18 +61,23 @@ What is *not* reported:
 
 ## 📦 Installation
 
-Ensure you have **Go 1.20+** installed.
+Requires **Go 1.25+**.
 
 ```bash
 # Build from source
 git clone https://github.com/MrEx-Right/SubReaper.git
-cd subreaper
-go mod tidy
-go build -o subreaper .
-
-# Or install directly via go install
-go install github.com/MrEx-Right/SubReaper@latest
+cd SubReaper
+make build            # or: go build -o subreaper .
 ```
+
+```bash
+# Or install with go install
+go install github.com/MrEx-Right/SubReaper@main
+```
+
+Use `@main` for v2: `@latest` still resolves to v1.0.0.
+
+Check the installed version with `subreaper --version`.
 
 ## 🚀 Usage
 
@@ -82,9 +91,9 @@ subreaper scan -t example.com
 subreaper scan -l targets.txt --only-vulnerable
 ```
 
-### 3. Discover subdomains then scan
+### 3. Discover subdomains, then scan
 ```bash
-# Uses crt.sh (Certificate Transparency) by default + built-in wordlist
+# crt.sh (Certificate Transparency) + built-in wordlist
 subreaper brute -t example.com
 
 # Custom wordlist + permutation generation
@@ -94,7 +103,7 @@ subreaper brute -t example.com -w /path/to/wordlist.txt --permutations
 subreaper brute -t example.com --all-sources
 ```
 
-The built-in wordlist is compiled into the binary, so `brute` works from any directory and after `go install`.
+The built-in wordlist is compiled into the binary, so `brute` works from any directory.
 
 ### 4. Passive research
 ```bash
@@ -105,19 +114,25 @@ subreaper research -t example.com
 subreaper research -t example.com --sources hackertarget,anubis,certspotter
 ```
 
-| Source | Key |
-|--------|-----|
-| crt.sh, Hackertarget, URLScan.io, Wayback Machine, RapidDNS, Anubis, CertSpotter | none |
-| AlienVault OTX | `OTX_API_KEY` (used automatically when set; skipped otherwise) |
-
-`URLSCAN_API_KEY` and `CERTSPOTTER_API_KEY` are optional and raise those sources' rate limits.
-
 ### 5. Output formats
 ```bash
 subreaper scan -t example.com --json -o results.json
 subreaper scan -t example.com -f markdown -o report.md
 subreaper scan -t example.com -f html -o report.html
 ```
+
+## 🛰️ OSINT Sources
+
+| Source | API key |
+|--------|---------|
+| crt.sh, Hackertarget, URLScan.io, Wayback Machine, RapidDNS, Anubis, CertSpotter | none |
+| AlienVault OTX | `OTX_API_KEY` (used automatically when set, skipped otherwise) |
+
+| Environment variable | Effect |
+|----------------------|--------|
+| `OTX_API_KEY` | Enables AlienVault OTX |
+| `URLSCAN_API_KEY` | Optional, raises the URLScan.io rate limit |
+| `CERTSPOTTER_API_KEY` | Optional, raises the CertSpotter rate limit |
 
 ## 🚩 Flags
 
@@ -133,18 +148,27 @@ subreaper scan -t example.com -f html -o report.html
 | `--timeout` | `10s` | Per-request timeout |
 | `--retries` | `2` | Retry count on failure |
 | `--resolvers` | — | File with custom DNS resolvers, one per line (`1.1.1.1` or `1.1.1.1:53`) |
-| `--only-vulnerable` | `false` | Show confirmed takeover candidates only |
+| `-V, --only-vulnerable` | `false` | Show confirmed takeover candidates only |
 | `--min-severity` | `info` | Minimum severity: `info\|low\|medium\|high\|critical` |
 | `--no-http` | `false` | DNS analysis only |
 | `--no-verify` | `false` | Skip Stage 4 claim verification |
 | `--no-color` | `false` | Disable colored output |
 | `--silent` | `false` | Suppress banner and progress |
 | `-v, --verbose` | `false` | Verbose output (lists scan errors) |
+| `--version` | — | Print the version |
 
-### Brute-specific Flags
+### `scan` Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-t, --target` | — | Single target domain |
+| `-l, --list` | — | File with one domain per line |
+
+### `brute` Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-t, --target` | — | Target domain (required) |
 | `-w, --wordlist` | built-in | Custom wordlist file |
 | `--no-crtsh` | `false` | Skip Certificate Transparency queries |
 | `--permutations` | `false` | Generate subdomain permutations |
@@ -152,13 +176,27 @@ subreaper scan -t example.com -f html -o report.html
 | `--all-sources` | `false` | Query all passive OSINT sources |
 | `--tech-detect` | `false` | Technology fingerprinting on probed subdomains |
 
+### `research` Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-t, --target` | — | Target domain (required) |
+| `--all-sources` | `true` | Query all passive OSINT sources |
+| `--sources` | — | Comma-separated OSINT sources (overrides `--all-sources`) |
+| `--no-crtsh` | `false` | Skip Certificate Transparency queries |
+| `-w, --wordlist` | — | Also run wordlist bruteforce with this file |
+| `--no-wordlist` | `false` | Skip the wordlist even when `--wordlist` is given |
+| `--tech-detect` | `true` | Technology fingerprinting |
+
+`research` is passive: it never runs active claim checks.
+
 Flags are validated before any network work starts, and the output file is opened up front, so a typo never costs a finished scan.
 
 ## 📊 Severity Model
 
 | Severity | Condition |
 |----------|-----------|
-| **CRITICAL** | Claim check passed — resource confirmed unclaimed and vulnerable |
+| **CRITICAL** | Claim check passed: resource confirmed unclaimed and vulnerable |
 | **HIGH** | Takeover evidence with confidence ≥80% (e.g. provider CNAME + NXDOMAIN target, or unclaimed page + provider header); SPF `+all` |
 | **MEDIUM** | Takeover evidence with confidence 60–79%, or NS record points to an NXDOMAIN nameserver |
 | **LOW** | CNAME target is NXDOMAIN but the provider is unknown; MX points to an NXDOMAIN host; SPF or DMARC missing, DMARC `p=none`, SPF `?all` |
@@ -183,15 +221,30 @@ Render, Webflow, Shopify, Tumblr, Intercom.
 **Not vulnerable** (identified for cleanup, reported as INFO at most): AWS CloudFront,
 Fly.io, Firebase Hosting, Fastly, Zendesk, Freshdesk, HubSpot, UserVoice, Squarespace.
 
+## 🛠️ Development
+
+```bash
+make test        # unit tests with the race detector
+make vet         # go vet
+make build-all   # cross-compile for Linux, Windows and macOS
+```
+
+The tests use an in-process DNS server, so they need no network access.
+
 ## 🤝 Contributing
-Contributions, issues, and feature requests are welcome!
-Feel free to check [issues page](https://github.com/MrEx-Right/SubReaper/issues).
+
+Contributions, issues and feature requests are welcome. See the [issues page](https://github.com/MrEx-Right/SubReaper/issues).
 
 ## ⚠️ Legal Notice
 
 SubReaper is intended for **authorized security testing only**. Using this tool against systems you do not own or have explicit written permission to test is illegal. The authors accept no liability for misuse.
 
+## 📄 License
+
+SubReaper is released under the [MIT License](LICENSE).
+
 ## 📚 References
 
-- [can-i-take-over-xyz](https://github.com/EdOverflow/can-i-take-over-xyz) — Community reference for takeover feasibility per provider
-- [HackerOne Subdomain Takeover reports](https://hackerone.com/hacktivity?querystring=subdomain+takeover)
+- [can-i-take-over-xyz](https://github.com/EdOverflow/can-i-take-over-xyz): community reference for takeover feasibility per provider
+- [HackerOne subdomain takeover reports](https://hackerone.com/hacktivity?querystring=subdomain+takeover)
+- [CHANGELOG](CHANGELOG.md): release history
